@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Study Assistant - Multi-Document Learning Hub</title>
+    <!-- Link to custom CSS styling -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <!-- Google Fonts for modern typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+
+    <div class="container">
+        <!-- Header Section -->
+        <header class="header">
+            <div class="logo-icon">📚</div>
+            <h1>PDF Study Assistant</h1>
+            <p>Upload multiple PDF documents and manage separate summaries, flashcards & quizzes per file</p>
+        </header>
+
+        <!-- Flash Alert Messages (Success / Error / Info) -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flash-container">
+                    {% for category, message in messages %}
+                        <div class="alert alert-{{ category }}">
+                            <span class="alert-icon">
+                                {% if category == 'success' %}✅{% elif category == 'info' %}ℹ️{% else %}⚠️{% endif %}
+                            </span>
+                            <span class="alert-message">{{ message }}</span>
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        <!-- Upload Form Card (Supports uploading multiple files over time) -->
+        <form action="/" method="POST" enctype="multipart/form-data" class="upload-card">
+            
+            <div class="drop-zone" id="drop-zone">
+                <div class="drop-icon">📁</div>
+                <h3>Upload a PDF Document</h3>
+                <p class="drop-text">Click below to browse your computer (you can upload multiple PDFs)</p>
+                <p class="file-type-badge">PDF Files Only</p>
+                
+                <!-- Hidden file input restricted to PDF files only -->
+                <input type="file" name="file" id="file-input" accept=".pdf" required hidden>
+                
+                <!-- Custom Upload Button -->
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('file-input').click()">
+                    Browse File
+                </button>
+
+                <!-- Display selected filename -->
+                <div class="selected-file" id="selected-file-display" style="display: none;">
+                    <span class="file-icon">📄</span>
+                    <span id="file-name-text">No file selected</span>
+                </div>
+            </div>
+
+            <!-- Submit Button -->
+            <button type="submit" class="btn btn-primary btn-block" id="submit-btn" disabled>
+                Upload & Process PDF
+            </button>
+        </form>
+
+        <!-- Your Documents Section (Multi-Document Management Hub) -->
+        {% if documents %}
+            <div class="docs-section-card">
+                <div class="docs-header">
+                    <div class="docs-title">
+                        <span class="docs-icon">📂</span>
+                        <h2>Your Documents Library</h2>
+                    </div>
+                    <span class="docs-count-badge">{{ documents|length }} Document{% if documents|length > 1 %}s{% endif %} Uploaded</span>
+                </div>
+
+                <div class="docs-grid">
+                    {% for name, doc in documents.items() %}
+                        {% set is_active = (name == active_filename) %}
+                        <div class="doc-card {% if is_active %}doc-card-active{% endif %}">
+                            <div class="doc-card-top">
+                                <div class="doc-info">
+                                    <span class="doc-icon">📄</span>
+                                    <div>
+                                        <h3 class="doc-filename">{{ name }}</h3>
+                                        <span class="doc-meta">Uploaded {{ doc.upload_time }} • {{ doc.word_count }} words</span>
+                                    </div>
+                                </div>
+                                {% if is_active %}
+                                    <span class="active-badge">Active Study Doc</span>
+                                {% endif %}
+                            </div>
+
+                            <div class="doc-card-actions">
+                                {% if not is_active %}
+                                    <a href="{{ url_for('select_doc', filename=name) }}" class="btn btn-secondary btn-sm">
+                                        📖 Select & Study
+                                    </a>
+                                {% else %}
+                                    <span class="currently-studying-label">Currently Studying</span>
+                                {% endif %}
+
+                                <form action="{{ url_for('delete_doc', filename=name) }}" method="POST" style="margin: 0;">
+                                    <button type="submit" class="btn btn-danger-link btn-sm" onclick="return confirm('Remove {{ name }} from your documents library?')">
+                                        🗑️ Remove
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        {% endif %}
+
+        <!-- Active Document Workspace Banner -->
+        {% if filename %}
+            <div class="active-workspace-banner">
+                <span class="workspace-icon">🎯</span>
+                <div>
+                    <span class="workspace-label">Currently Studying:</span>
+                    <strong class="workspace-filename">{{ filename }}</strong>
+                </div>
+            </div>
+        {% endif %}
+
+        <!-- Section 1: Extracted Text Results Display -->
+        {% if extracted_text %}
+            <div class="result-card">
+                <div class="result-header">
+                    <div class="result-title">
+                        <span class="result-icon">📝</span>
+                        <h2>Extracted Document Text</h2>
+                    </div>
+                    <div class="badges-group">
+                        {% if word_count %}
+                            <span class="stat-badge">{{ word_count }} Words</span>
+                        {% endif %}
+                        <span class="file-name-badge">{{ filename }}</span>
+                    </div>
+                </div>
+                
+                <div class="text-container">
+                    <pre>{{ extracted_text }}</pre>
+                </div>
+            </div>
+        {% endif %}
+
+        <!-- Section 2: Summary Notes Display -->
+        {% if summary_notes %}
+            <div class="summary-card">
+                <div class="summary-header">
+                    <div class="summary-title">
+                        <span class="summary-icon">💡</span>
+                        <h2>Key Summary Notes</h2>
+                    </div>
+                    <span class="summary-count-badge">{{ summary_notes|length }} Key Takeaways</span>
+                </div>
+                
+                <div class="summary-content">
+                    <ul class="summary-list">
+                        {% for note in summary_notes %}
+                            <li class="summary-item">
+                                <span class="bullet-point">📌</span>
+                                <div class="note-text">{{ note }}</div>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+        {% endif %}
+
+        <!-- Section 3: Interactive Study Flashcards -->
+        {% if flashcards %}
+            <div class="flashcard-section-card">
+                <div class="flashcard-header">
+                    <div class="flashcard-title">
+                        <span class="flashcard-icon">🎴</span>
+                        <h2>Study Flashcards</h2>
+                    </div>
+                    <span class="card-counter-badge" id="card-counter">Card 1 of {{ flashcards|length }}</span>
+                </div>
+
+                <!-- Flashcard Display Stage -->
+                <div class="flashcard-stage">
+                    {% for card in flashcards %}
+                        <div class="flashcard-wrapper {% if loop.first %}active-card{% else %}hidden-card{% endif %}" id="card-{{ loop.index }}">
+                            <div class="flashcard-inner" id="card-inner-{{ loop.index }}" onclick="flipCurrentCard()">
+                                
+                                <!-- FRONT SIDE: Question / Concept -->
+                                <div class="flashcard-face flashcard-front">
+                                    <div class="card-tag">FRONT • QUESTION / CONCEPT</div>
+                                    <div class="card-content-text">{{ card.front }}</div>
+                                    <div class="card-footer-hint">🔄 Click card or 'Flip Card' to see answer</div>
+                                </div>
+
+                                <!-- BACK SIDE: Answer / Explanation -->
+                                <div class="flashcard-face flashcard-back">
+                                    <div class="card-tag card-tag-back">BACK • ANSWER / EXPLANATION</div>
+                                    <div class="card-content-text">{{ card.back }}</div>
+                                    <div class="card-footer-hint">🔄 Click card or 'Flip Card' to return to front</div>
+                                </div>
+                            </div>
+                        </div>
+                    {% endfor %}
+                </div>
+
+                <!-- Flashcard Interactive Controls -->
+                <div class="flashcard-controls">
+                    <button type="button" class="btn btn-secondary" id="prev-card-btn" onclick="prevCard()" disabled>
+                        ← Previous
+                    </button>
+                    <button type="button" class="btn btn-primary" id="flip-card-btn" onclick="flipCurrentCard()">
+                        🔄 Flip Card
+                    </button>
+                    <button type="button" class="btn btn-secondary" id="next-card-btn" onclick="nextCard()">
+                        Next →
+                    </button>
+                </div>
+            </div>
+        {% endif %}
+
+        <!-- Section 4: Timed Multiple-Choice Quiz -->
+        {% if quiz_questions %}
+            <div class="quiz-card">
+                <div class="quiz-header">
+                    <div class="quiz-title">
+                        <span class="quiz-icon">⏱️</span>
+                        <h2>Timed Mock Test</h2>
+                    </div>
+
+                    <div class="quiz-header-badges">
+                        {% if not submitted %}
+                            <div class="timer-badge" id="quiz-timer-badge">
+                                <span class="timer-icon">⏳</span>
+                                <span class="timer-label">Time:</span>
+                                <strong id="timer-display">02:00</strong>
+                            </div>
+                        {% endif %}
+                        <span class="quiz-count-badge">5 Questions</span>
+                    </div>
+                </div>
+
+                <!-- Display Score Banner After Submission -->
+                {% if submitted %}
+                    <div class="score-banner">
+                        <div class="score-info">
+                            <span class="score-trophy">🏆</span>
+                            <div>
+                                <h3>Quiz Results</h3>
+                                <p>You scored <strong>{{ score }} / {{ quiz_questions|length }}</strong> correct answers on {{ filename }}</p>
+                            </div>
+                        </div>
+                        <form action="/reset_quiz" method="POST" style="margin: 0;">
+                            <button type="submit" class="btn btn-secondary btn-sm">Retake Quiz</button>
+                        </form>
+                    </div>
+                {% endif %}
+                
+                <!-- Quiz Form -->
+                <form action="/submit_quiz" method="POST" class="quiz-form" id="quiz-form">
+                    <div class="mcq-list">
+                        {% for mcq in quiz_questions %}
+                            {% set q_num = mcq.question_number|string %}
+                            {% set user_choice = user_answers.get(q_num) %}
+                            
+                            <div class="mcq-card {% if submitted %}{% if user_choice == mcq.correct_letter %}card-correct{% else %}card-incorrect{% endif %}{% endif %}">
+                                <!-- Question Header -->
+                                <div class="mcq-question-header">
+                                    <span class="mcq-number">Q{{ mcq.question_number }}</span>
+                                    <h3 class="mcq-question-text">{{ mcq.question }}</h3>
+                                </div>
+
+                                <!-- 4 Interactive Radio Button Options -->
+                                <div class="options-grid">
+                                    {% for option in mcq.options %}
+                                        {% set letter = option[0] %}
+                                        {% set is_selected = (user_choice == letter) %}
+                                        {% set is_correct_choice = (letter == mcq.correct_letter) %}
+                                        
+                                        <label class="option-label 
+                                            {% if not submitted and is_selected %}selected-before-submit{% endif %}
+                                            {% if submitted and is_correct_choice %}option-correct{% endif %}
+                                            {% if submitted and is_selected and not is_correct_choice %}option-wrong{% endif %}">
+                                            
+                                            <!-- Radio Input -->
+                                            <input type="radio" 
+                                                   name="q_{{ mcq.question_number }}" 
+                                                   value="{{ letter }}" 
+                                                   {% if is_selected %}checked{% endif %}
+                                                   {% if submitted %}disabled{% endif %}
+                                                   required>
+                                            
+                                            <span class="option-letter">{{ letter }}</span>
+                                            <span class="option-body">{{ option[3:] }}</span>
+                                            
+                                            <!-- Submission Feedback Badges -->
+                                            {% if submitted %}
+                                                {% if is_correct_choice %}
+                                                    <span class="correct-badge">✅ Correct</span>
+                                                {% elif is_selected %}
+                                                    <span class="wrong-badge">❌ Your Choice</span>
+                                                {% endif %}
+                                            {% endif %}
+                                        </label>
+                                    {% endfor %}
+                                </div>
+
+                                <!-- Display Correct Answer Banner AFTER Submission Only -->
+                                {% if submitted %}
+                                    <div class="answer-banner">
+                                        <span class="answer-icon">💡</span>
+                                        <span class="answer-label">Correct Answer:</span>
+                                        <strong class="answer-highlight">Option {{ mcq.correct_letter }}</strong>
+                                    </div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    </div>
+
+                    <!-- Submit Quiz Button -->
+                    {% if not submitted %}
+                        <div class="submit-container">
+                            <button type="submit" class="btn btn-primary btn-block btn-lg" id="manual-submit-btn">
+                                Submit Quiz
+                            </button>
+                        </div>
+                    {% endif %}
+                </form>
+            </div>
+        {% endif %}
+
+        <!-- Section 5: Score Tracking Dashboard (Your Progress) -->
+        {% if score_history %}
+            <div class="history-card">
+                <div class="history-header">
+                    <div class="history-title">
+                        <span class="history-icon">📊</span>
+                        <h2>Document Score History ({{ filename }})</h2>
+                    </div>
+                    <form action="/clear_history" method="POST" style="margin:0;">
+                        <button type="submit" class="btn btn-secondary btn-sm">Clear History</button>
+                    </form>
+                </div>
+
+                <div class="history-content">
+                    <div class="history-list">
+                        {% for attempt in score_history|reverse %}
+                            <div class="history-item">
+                                <div class="history-item-left">
+                                    <span class="attempt-badge">Attempt #{{ attempt.id }}</span>
+                                    <div class="history-meta">
+                                        <span class="history-filename">📄 {{ attempt.filename }}</span>
+                                        <span class="history-time">🕒 {{ attempt.timestamp }}</span>
+                                    </div>
+                                </div>
+
+                                <div class="history-item-right">
+                                    <span class="score-display">{{ attempt.score }} / {{ attempt.total }}</span>
+                                    <span class="percentage-pill 
+                                        {% if attempt.percentage >= 80 %}score-high
+                                        {% elif attempt.percentage >= 60 %}score-med
+                                        {% else %}score-low{% endif %}">
+                                        {{ attempt.percentage }}%
+                                    </span>
+                                </div>
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        {% endif %}
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Step 10: Multi-Document PDF Upload, Extraction, Summary, Flashcards, Quiz & History Hub</p>
+        </footer>
+    </div>
+
+    <!-- Simple JavaScript for Interactive UX, Flashcards & Timed Countdown -->
+    <script>
+        // File selection handling
+        const fileInput = document.getElementById('file-input');
+        const fileDisplay = document.getElementById('selected-file-display');
+        const fileNameText = document.getElementById('file-name-text');
+        const submitBtn = document.getElementById('submit-btn');
+
+        if (fileInput) {
+            fileInput.addEventListener('change', function() {
+                if (this.files && this.files.length > 0) {
+                    const file = this.files[0];
+                    if (file.name.toLowerCase().endsWith('.pdf')) {
+                        fileNameText.textContent = file.name;
+                        fileDisplay.style.display = 'flex';
+                        submitBtn.disabled = false;
+                    } else {
+                        alert('Please select a valid PDF file (.pdf)!');
+                        this.value = '';
+                        fileDisplay.style.display = 'none';
+                        submitBtn.disabled = true;
+                    }
+                } else {
+                    fileDisplay.style.display = 'none';
+                    submitBtn.disabled = true;
+                }
+            });
+        }
+
+        // Interactive Flashcards Logic
+        let currentCardIndex = 1;
+        const totalCards = {{ flashcards|length if flashcards else 0 }};
+
+        function flipCurrentCard() {
+            const cardInner = document.getElementById(`card-inner-${currentCardIndex}`);
+            if (cardInner) {
+                cardInner.classList.toggle('is-flipped');
+            }
+        }
+
+        function showCard(index) {
+            for (let i = 1; i <= totalCards; i++) {
+                const card = document.getElementById(`card-${i}`);
+                const cardInner = document.getElementById(`card-inner-${i}`);
+                if (card) {
+                    card.classList.remove('active-card');
+                    card.classList.add('hidden-card');
+                }
+                if (cardInner) {
+                    cardInner.classList.remove('is-flipped');
+                }
+            }
+
+            const targetCard = document.getElementById(`card-${index}`);
+            if (targetCard) {
+                targetCard.classList.remove('hidden-card');
+                targetCard.classList.add('active-card');
+            }
+
+            const counter = document.getElementById('card-counter');
+            if (counter) {
+                counter.textContent = `Card ${index} of ${totalCards}`;
+            }
+
+            const prevBtn = document.getElementById('prev-card-btn');
+            const nextBtn = document.getElementById('next-card-btn');
+
+            if (prevBtn) prevBtn.disabled = (index === 1);
+            if (nextBtn) nextBtn.disabled = (index === totalCards);
+        }
+
+        function nextCard() {
+            if (currentCardIndex < totalCards) {
+                currentCardIndex++;
+                showCard(currentCardIndex);
+            }
+        }
+
+        function prevCard() {
+            if (currentCardIndex > 1) {
+                currentCardIndex--;
+                showCard(currentCardIndex);
+            }
+        }
+
+        // Timed Mock Test Countdown & Auto-Submit Logic
+        {% if quiz_questions and not submitted %}
+            let timeRemaining = 120;
+            const timerDisplay = document.getElementById('timer-display');
+            const quizForm = document.getElementById('quiz-form');
+
+            function updateTimer() {
+                const minutes = Math.floor(timeRemaining / 60);
+                const seconds = timeRemaining % 60;
+                
+                const formattedMin = minutes < 10 ? '0' + minutes : minutes;
+                const formattedSec = seconds < 10 ? '0' + seconds : seconds;
+                
+                if (timerDisplay) {
+                    timerDisplay.textContent = `${formattedMin}:${formattedSec}`;
+                    
+                    if (timeRemaining <= 30) {
+                        timerDisplay.classList.add('timer-warning');
+                    }
+                }
+
+                if (timeRemaining <= 0) {
+                    clearInterval(quizTimerInterval);
+                    alert('⏰ Time is up! Your mock test is being auto-submitted.');
+                    
+                    if (quizForm) {
+                        const radioInputs = quizForm.querySelectorAll('input[type="radio"]');
+                        radioInputs.forEach(input => input.removeAttribute('required'));
+                        quizForm.submit();
+                    }
+                } else {
+                    timeRemaining--;
+                }
+            }
+
+            const quizTimerInterval = setInterval(updateTimer, 1000);
+            updateTimer();
+        {% endif %}
+    </script>
+</body>
+</html>
