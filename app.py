@@ -145,105 +145,75 @@ def generate_summary_notes(text):
     return [item[2] for item in top_sentences]
 
 # Simple, beginner-friendly Multiple-Choice Question (MCQ) Generator (Pure Python)
-def generate_mcq_quiz(text):
-    """
-    Generates 5 Multiple-Choice Questions (MCQs), each with 4 options (A, B, C, D) 
-    and a clearly marked correct answer based on document text.
-    """
-    mcq_list = []
-    
-    distractor_pool = [
-        "It is a legacy file storage protocol for local printing.",
-        "It refers to manual paper calculations without computers.",
-        "It is an uncompressed audio file format.",
-        "It is a hardware cable used to connect monitor displays.",
-        "It is a database backup standard used in mainframe servers.",
-        "It represents a physical document archive format.",
-        "It is an obsolete network protocol from the 1980s.",
-        "It refers to an offline graphic design layout technique."
-    ]
-    
-    if text and "No readable text found" not in text and "Error reading" not in text:
-        raw_sentences = re.split(r'(?<=[.!?])\s+', text)
-        sentences = [s.strip() for s in raw_sentences if len(s.strip().split()) > 4 and not s.startswith('--- Page')]
-        
-        for idx, sentence in enumerate(sentences):
-            if len(mcq_list) >= 5:
-                break
-            
-            words = sentence.split()
-            if len(words) < 5:
-                continue
-                
-            subject_match = re.search(r'\b([A-Z][a-zA-Z0-9\s]{1,25})\b\s+(is|are|allows|enables|helps|provides|requires|uses)\b', sentence)
-            
-            if subject_match:
-                subject = subject_match.group(1).strip()
-                verb = subject_match.group(2).strip()
-                q_text = f"According to the text, what does it state regarding {subject}?"
-                rest = sentence.split(subject_match.group(0))[-1].strip()
-                correct_statement = f"It {verb} {rest}"
-            else:
-                q_text = "Which of the following statements is directly supported by the document?"
-                correct_statement = sentence.strip()
-                
-            correct_statement = correct_statement.rstrip('.!?') + '.'
-            
-            available_distractors = [d for d in distractor_pool if d.lower() not in sentence.lower()]
-            selected_indices = [(idx + i) % len(available_distractors) for i in range(3)]
-            distractors = [available_distractors[i] for i in selected_indices]
-            
-            correct_pos = idx % 4
-            option_letters = ['A', 'B', 'C', 'D']
-            
-            raw_options = []
-            d_counter = 0
-            for pos in range(4):
-                if pos == correct_pos:
-                    raw_options.append(correct_statement)
-                else:
-                    raw_options.append(distractors[d_counter])
-                    d_counter += 1
-                    
-            formatted_options = [f"{option_letters[i]}) {raw_options[i]}" for i in range(4)]
-            
-            mcq_item = {
-                'question_number': len(mcq_list) + 1,
-                'question': q_text,
-                'options': formatted_options,
-                'correct_letter': option_letters[correct_pos],
-                'correct_text': raw_options[correct_pos]
-            }
-            
-            mcq_list.append(mcq_item)
+import re
+import random
 
-    fallback_questions = [
-        ("What is the main purpose of this PDF study tool?", "To extract document text, generate summary notes, and provide practice quizzes.", "A"),
-        ("Which file format is supported for file uploads in this application?", "PDF (.pdf) Document Format.", "A"),
-        ("How are summary notes generated in this application?", "By analyzing keyword frequencies and scoring key document sentences.", "A"),
-        ("What should you do after reviewing the extracted text and summary notes?", "Answer the multiple-choice practice quiz to test your knowledge.", "A"),
-        ("How are uploaded PDF files stored in this system?", "They are saved locally inside the designated 'uploads' folder.", "A")
-    ]
-    
-    fb_idx = 0
-    while len(mcq_list) < 5 and fb_idx < len(fallback_questions):
-        q, corr_ans, corr_let = fallback_questions[fb_idx]
+def generate_mcq_quiz(text):
+    mcq_list = []
+
+    if not text or "No readable text found" in text or "Error reading" in text:
+        return []
+
+    # Split into clean sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = [s.strip() for s in sentences if len(s.split()) > 6]
+
+    for idx, sentence in enumerate(sentences):
+        if len(mcq_list) >= 5:
+            break
+
+        words = sentence.split()
+
+        # Try to find a keyword (capital word or important noun)
+        keywords = [w for w in words if w[0].isupper() and len(w) > 3]
+
+        if not keywords:
+            continue
+
+        answer = sentence.strip().rstrip('.!?') + "."
+
+        # Create question
+        question = f"What does the text say about '{keywords[0]}'?"
+
+        # Create distractors from OTHER sentences (better than random pool)
+        other_sentences = [s for s in sentences if s != sentence]
+        random.shuffle(other_sentences)
+
+        distractors = []
+        for s in other_sentences:
+            if len(distractors) >= 3:
+                break
+            if len(s.split()) > 6:
+                distractors.append(s.strip().rstrip('.!?') + ".")
+
+        if len(distractors) < 3:
+            continue
+
+        # Mix options
+        options = distractors + [answer]
+        random.shuffle(options)
+
+        option_letters = ['A', 'B', 'C', 'D']
+        formatted_options = []
+
+        correct_letter = ""
+
+        for i, opt in enumerate(options):
+            formatted_options.append(f"{option_letters[i]}) {opt}")
+            if opt == answer:
+                correct_letter = option_letters[i]
+
         mcq_item = {
             'question_number': len(mcq_list) + 1,
-            'question': q,
-            'options': [
-                f"A) {corr_ans}",
-                "B) To format hard drive storage partitions.",
-                "C) To execute raw video compression streams.",
-                "D) To compile C++ source code."
-            ],
-            'correct_letter': 'A',
-            'correct_text': corr_ans
+            'question': question,
+            'options': formatted_options,
+            'correct_letter': correct_letter,
+            'correct_text': answer
         }
+
         mcq_list.append(mcq_item)
-        fb_idx += 1
-        
-    return mcq_list[:5]
+
+    return mcq_list
 
 # Simple, beginner-friendly Flashcard Generator (Pure Python)
 def generate_flashcards(text):
