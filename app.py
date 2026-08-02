@@ -145,75 +145,171 @@ def generate_summary_notes(text):
     return [item[2] for item in top_sentences]
 
 # Simple, beginner-friendly Multiple-Choice Question (MCQ) Generator (Pure Python)
-import re
 import random
 
-def generate_mcq_quiz(text):
-    mcq_list = []
-
-    if not text or "No readable text found" in text or "Error reading" in text:
+def extract_all_pdf_concepts(text):
+    """
+    Extracts all key terms, subjects, and concepts directly from ANY PDF text.
+    No hardcoded lists or static fallbacks used.
+    """
+    if not text:
         return []
 
-    # Split into clean sentences
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = [s.strip() for s in sentences if len(s.split()) > 6]
+    concepts = []
+    seen = set()
 
-    for idx, sentence in enumerate(sentences):
+    # 1. Extract subjects/terms matching subject-verb patterns in sentences
+    raw_sentences = re.split(r'(?<=[.!?])\s+', text)
+    for s in raw_sentences:
+        m = re.search(r'\b([A-Z][a-zA-Z0-9\s]{1,30})\b\s+(is|are|enables|provides|uses|requires|allows|helps|creates|includes|refers to|means|breaks down|break down|converts|produces|contains|stores|absorbs|forms|consists of)\b', s, flags=re.IGNORECASE)
+        if m:
+            term = m.group(1).strip()
+            term = re.sub(r'^(a|an|the)\s+', '', term, flags=re.IGNORECASE).strip()
+            term = re.sub(r'\b(\w+)\s+\1\b', r'\1', term, flags=re.IGNORECASE).capitalize()
+            if len(term.split()) <= 3 and len(term) >= 3 and term.lower() not in seen:
+                seen.add(term.lower())
+                concepts.append(term)
+
+    # 2. Extract capitalized terms & prominent nouns from text
+    words = re.findall(r'\b[A-Z][a-zA-Z0-9-]{2,}\b', text)
+    stop_words = {
+        'this', 'that', 'these', 'those', 'with', 'from', 'have', 'has', 'had', 'which', 'where', 
+        'when', 'what', 'they', 'their', 'them', 'some', 'other', 'into', 'only', 'also', 'than', 
+        'then', 'about', 'each', 'such', 'page', 'type', 'main', 'text', 'first', 'second', 'well', 
+        'like', 'back', 'down', 'over', 'more', 'most', 'very', 'living', 'things', 'make', 'using', 
+        'used', 'were', 'been', 'being', 'does', 'did', 'done', 'will', 'would', 'could', 'should'
+    }
+
+    for w in words:
+        w_clean = re.sub(r'^(a|an|the)\s+', '', w, flags=re.IGNORECASE).strip().capitalize()
+        if w_clean.lower() not in stop_words and len(w_clean) >= 3 and w_clean.lower() not in seen:
+            seen.add(w_clean.lower())
+            concepts.append(w_clean)
+
+    # 3. If concepts are sparse, extract key 2-3 word phrases from sentences
+    if len(concepts) < 4:
+        for s in raw_sentences:
+            s_clean = s.strip()
+            if len(s_clean.split()) >= 4:
+                phrase = ' '.join(s_clean.split()[:3]).rstrip(',.!?').capitalize()
+                if phrase.lower() not in seen and len(phrase) >= 3:
+                    seen.add(phrase.lower())
+                    concepts.append(phrase)
+
+    return concepts
+
+def generate_mcqs(text, difficulty="medium"):
+    """
+    100% Dynamic MCQ Generator for ANY subject PDF.
+    - Zero hardcoded fallback lists or static distractors.
+    - All 4 options come 100% from the uploaded PDF text.
+    - Context-aware for Science, Math, English, History, Law, CS, etc.
+    """
+    if not text or "No readable text found" in text or "Error reading" in text:
+        text = ""
+
+    # Extract all concepts/terms directly from the PDF text
+    pdf_concepts = extract_all_pdf_concepts(text)
+
+    raw_sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = []
+    for s in raw_sentences:
+        s_clean = s.strip()
+        if len(s_clean.split()) >= 5 and not s_clean.startswith('--- Page'):
+            s_clean = re.sub(r'\b(\w+)\s+\1\b', r'\1', s_clean, flags=re.IGNORECASE)
+            sentences.append(s_clean)
+
+    mcq_list = []
+    option_letters = ['A', 'B', 'C', 'D']
+    used_answers = set()
+
+    for sentence in sentences:
         if len(mcq_list) >= 5:
             break
 
-        words = sentence.split()
+        match = re.search(r'\b([A-Z][a-zA-Z0-9\s]{1,30})\b\s+(is|are|enables|provides|uses|requires|allows|helps|creates|includes|refers to|means|breaks down|break down|converts|produces|contains|stores|absorbs|forms|consists of)\b\s+(.+)', sentence, flags=re.IGNORECASE)
 
-        # Try to find a keyword (capital word or important noun)
-        keywords = [w for w in words if w[0].isupper() and len(w) > 3]
+        if match:
+            target_term = match.group(1).strip()
+            target_term = re.sub(r'^(a|an|the)\s+', '', target_term, flags=re.IGNORECASE).strip()
+            target_term = re.sub(r'\b(\w+)\s+\1\b', r'\1', target_term, flags=re.IGNORECASE).capitalize()
+            verb = match.group(2).strip().lower()
+            rest = match.group(3).strip().rstrip('.!?')
 
-        if not keywords:
-            continue
+            if target_term.lower() in used_answers or len(target_term) < 3:
+                continue
 
-        answer = sentence.strip().rstrip('.!?') + "."
+            used_answers.add(target_term.lower())
+            correct_answer = target_term
 
-        # Create question
-        question = f"What does the text say about '{keywords[0]}'?"
+            if verb in ['is', 'are']:
+                question_text = f"Which term describes {rest}?"
+            elif verb in ['refers to', 'means']:
+                question_text = f"Which term refers to {rest}?"
+            elif verb in ['break down', 'breaks down']:
+                question_text = f"Which organisms or factors break down {rest}?"
+            elif verb in ['converts', 'convert']:
+                question_text = f"What process is responsible for converting {rest}?"
+            elif verb in ['absorbs', 'absorb']:
+                question_text = f"Which component or substance absorbs {rest}?"
+            else:
+                question_text = f"Which key concept {verb} {rest}?"
+        else:
+            words = sentence.split()
+            if len(words) < 5:
+                continue
+            cand_term = words[0].capitalize().rstrip(',.!?')
+            cand_term = re.sub(r'^(a|an|the)\s+', '', cand_term, flags=re.IGNORECASE).strip().capitalize()
+            if cand_term.lower() in used_answers or len(cand_term) < 3:
+                continue
 
-        # Create distractors from OTHER sentences (better than random pool)
-        other_sentences = [s for s in sentences if s != sentence]
-        random.shuffle(other_sentences)
+            used_answers.add(cand_term.lower())
+            correct_answer = cand_term
+            rest_sentence = ' '.join(words[1:]).rstrip('.!?')
+            question_text = f"Which term is associated with {rest_sentence}?"
 
+        # Build 3 distractors ONLY from pdf_concepts (extracted 100% from THIS PDF!)
         distractors = []
-        for s in other_sentences:
-            if len(distractors) >= 3:
-                break
-            if len(s.split()) > 6:
-                distractors.append(s.strip().rstrip('.!?') + ".")
+        for concept in pdf_concepts:
+            if concept.lower() != correct_answer.lower() and concept.lower() not in [d.lower() for d in distractors]:
+                distractors.append(concept)
+                if len(distractors) == 3:
+                    break
 
+        # If PDF is very short and has <3 other concepts, extract short phrase predicates from other sentences
         if len(distractors) < 3:
-            continue
+            for s in sentences:
+                if s != sentence:
+                    words = s.split()
+                    if len(words) >= 3:
+                        phrase = ' '.join(words[:2]).capitalize()
+                        if phrase.lower() != correct_answer.lower() and phrase.lower() not in [d.lower() for d in distractors]:
+                            distractors.append(phrase)
+                            if len(distractors) == 3:
+                                break
 
-        # Mix options
-        options = distractors + [answer]
-        random.shuffle(options)
+        # Shuffle correct answer + 3 PDF distractors
+        raw_options = [correct_answer] + distractors[:3]
+        random.shuffle(raw_options)
 
-        option_letters = ['A', 'B', 'C', 'D']
-        formatted_options = []
+        correct_index = raw_options.index(correct_answer)
+        correct_letter = option_letters[correct_index]
 
-        correct_letter = ""
+        formatted_options = [f"{option_letters[i]}) {raw_options[i]}" for i in range(4)]
 
-        for i, opt in enumerate(options):
-            formatted_options.append(f"{option_letters[i]}) {opt}")
-            if opt == answer:
-                correct_letter = option_letters[i]
-
-        mcq_item = {
+        mcq_list.append({
             'question_number': len(mcq_list) + 1,
-            'question': question,
+            'question': question_text,
             'options': formatted_options,
             'correct_letter': correct_letter,
-            'correct_text': answer
-        }
+            'correct_text': correct_answer
+        })
 
-        mcq_list.append(mcq_item)
+    return mcq_list[:5]
 
-    return mcq_list
+
+
+
 
 # Simple, beginner-friendly Flashcard Generator (Pure Python)
 def generate_flashcards(text):
@@ -317,7 +413,7 @@ def index():
             # Process PDF: Extract text, summary, quiz, and flashcards
             extracted_text = extract_text_from_pdf(file_path)
             summary_notes = generate_summary_notes(extracted_text)
-            quiz_questions = generate_mcq_quiz(extracted_text)
+            quiz_questions = generate_mcqs(extracted_text)
             flashcards = generate_flashcards(extracted_text)
             word_count = len(extracted_text.split())
             upload_time = datetime.now().strftime('%b %d, %Y at %I:%M %p')
