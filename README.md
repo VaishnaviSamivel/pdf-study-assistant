@@ -1,53 +1,46 @@
-# ⚡ AI-Powered PDF Chatbot using RAG (Flask + Groq LLaMA 3)
+# ⚡ GroqPDF - Ultra-Fast RAG PDF Chatbot ("ChatGPT for PDFs")
 
-An interactive, full-stack AI application that transforms uploaded PDF documents into a conversational chatbot ("ChatGPT for PDFs"). Powered by **Flask**, **Groq LLaMA 3 (llama3-8b-8192)**, **RAG (Retrieval-Augmented Generation)**, **`python-dotenv`**, and **SQLite**.
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Flask](https://img.shields.io/badge/Flask-3.1.3-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
+[![Groq](https://img.shields.io/badge/Groq-LLaMA--3.1--8b-f55036?style=for-the-badge&logo=groq&logoColor=white)](https://console.groq.com/)
+[![License](https://img.shields.io/badge/License-MIT-green.style=for-the-badge)](LICENSE)
+
+An intelligent, full-stack AI web application that transforms uploaded PDF documents into an interactive conversational assistant. Powered by **Flask**, **Groq LLaMA 3.1 (`llama-3.1-8b-instant`)**, **RAG (Retrieval-Augmented Generation)**, and **SQLite**.
 
 ---
 
-## ✨ Key Features
+## 🌟 Recommended Project Names
 
-- ⚡ **Groq LLaMA 3 API Integration**: Uses Groq's high-speed inference engine (`llama3-8b-8192`) via `groq` SDK to generate clear, concise answers.
-- 📄 **Page-Level PDF Extraction & Chunking**: Extracts text page-by-page from PDFs using `pypdf` / `PyPDF2` into overlapping text chunks with page number metadata.
-- 🔍 **RAG Retrieval Engine**: Uses keyword similarity and TF-IDF relevance scoring to retrieve the top 3 most relevant PDF chunks per query.
-- 🛡️ **Strict Context Prompting**: Enforces strict context-only answers: *"Answer ONLY using the provided context. If the answer is not in the context, say 'Not found in document'."*
-- 🔄 **Hybrid Fallback Architecture**: Automatically falls back to an internal extractive QA engine if `GROQ_API_KEY` is not configured or an API error occurs.
-- 💬 **Interactive Chat UI**: Modern dark-theme chat interface with real-time AJAX messaging, "Thinking..." loader, markdown parsing, and expandable **PDF Source Citations** (top 3 chunks).
-- 🗄️ **Persistent SQLite History**: Saves conversation history per document across sessions in SQLite (`database.db`).
-- ☁️ **Render Cloud Ready**: Configured with `/tmp` storage for file uploads and database persistence.
+If you are updating your GitHub repository title, portfolio, or resume, here are catchy name suggestions:
+
+1. ⚡ **GroqPDF** (*Ultra-Fast RAG PDF Chatbot*) – *(Recommended)*
+2. 📄 **DocuChat AI** (*Interactive PDF Knowledge Assistant*)
+3. 🚀 **PulsePDF AI** (*Lightning RAG Assistant powered by LLaMA 3*)
+4. 🧠 **StudyGenie AI** (*ChatGPT for PDF Study Materials*)
+
+---
+
+## ✨ Features
+
+- ⚡ **Ultra-Fast LLaMA 3 Inference**: Powered by Groq's LPUs (`llama-3.1-8b-instant`) for instant response generation.
+- 📄 **Page-Level PDF Extraction & Chunking**: Parses PDFs using `pypdf` / `PyPDF2` into overlapping, searchable text chunks with page metadata.
+- 🔍 **RAG Retrieval Engine**: Uses keyword relevance and TF-IDF scoring to retrieve the top 3 most relevant PDF chunks per query.
+- 🎯 **Strict Context Answering**: Instructs the LLM to answer strictly from retrieved PDF context. Returns `"Not found in document"` if information is absent.
+- 🛡️ **Hybrid Fallback QA System**: Automatically falls back to an internal extractive QA engine if the API key is unconfigured or rate-limited.
+- 💬 **Modern Glassmorphism UI**: Features real-time AJAX messaging, a `"Thinking..."` spinner loader, markdown rendering, empty question prevention, and 5MB upload size validation.
+- 📌 **Expandable PDF Source Citations**: Every assistant response includes page badges and exact text excerpts used to formulate the answer.
+- 🗄️ **Persistent SQLite History**: Maintains conversation history for every PDF document across sessions in SQLite (`database.db`).
+- ☁️ **Render Cloud Deployment Ready**: Pre-configured with environment variables and `/tmp` directory fallbacks for seamless cloud hosting.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Backend Framework**: Flask 3.1.3, Werkzeug 3.1.8
+- **Backend Framework**: Python 3.9+, Flask 3.1.3, Werkzeug 3.1.8
 - **AI & RAG Engine**: Groq SDK (`groq`), Scikit-Learn, NumPy, PyPDF / PyPDF2
-- **Environment & Utilities**: `python-dotenv`, Requests, Tempfile
-- **Frontend**: HTML5, Vanilla CSS3 (Custom Glassmorphism), JavaScript (ES6, Marked.js)
-- **Production Server**: Gunicorn 23.0.0
-
----
-
-## 🔑 Environment Variables Setup
-
-Create a `.env` file in the root directory (copied from `.env.example`):
-
-```bash
-cp .env.example .env
-```
-
-Add your Groq API key:
-
-```env
-# Groq API Key (Get your free key at: https://console.groq.com/)
-GROQ_API_KEY=your_groq_api_key_here
-
-# Application Configuration
-PORT=5000
-UPLOAD_FOLDER=/tmp/uploads
-DATABASE_PATH=/tmp/database.db
-```
-
-> ⚠️ **Security Rule**: Never commit `.env` to GitHub! It is ignored by `.gitignore`.
+- **Environment & Storage**: `python-dotenv`, SQLite3, Tempfile
+- **Frontend**: HTML5, Vanilla CSS3 (Custom Dark Glassmorphism Theme), JavaScript (ES6, Marked.js)
+- **Production WSGI Server**: Gunicorn 23.0.0
 
 ---
 
@@ -55,38 +48,58 @@ DATABASE_PATH=/tmp/database.db
 
 ```text
 pdf-study-assistant/
-├── app.py              # Flask server, RAG retrieval, Groq API integration & routes
+├── app.py              # Main Flask server, RAG retrieval engine, Groq SDK & routes
 ├── database.db         # Persistent SQLite database (auto-created on startup)
 ├── requirements.txt    # Production dependencies
 ├── .env                # Local secrets file (git-ignored)
 ├── .env.example        # Environment variable template for repository
-├── .gitignore          # Git tracking exclusions (.env, *.db, uploads/, __pycache__)
+├── .gitignore          # Version control ignore rules (.env, *.db, uploads/, __pycache__)
 ├── static/
-│   └── style.css       # Design system, CSS variables & chat bubbles
+│   └── style.css       # Custom design system, CSS variables, dark theme & chat bubbles
 └── templates/
-    └── index.html      # Responsive Chatbot SPA template
+    └── index.html      # Responsive Chatbot Single-Page Application (SPA) layout
 ```
+
+---
+
+## 🔑 Environment Variables Setup
+
+Follow these steps to set up API keys for local development:
+
+1. **Copy `.env.example` to create `.env`**:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Add your Groq API Key in `.env`**:
+   ```env
+   GROQ_API_KEY=gsk_your_actual_groq_api_key_here
+   PORT=5000
+   UPLOAD_FOLDER=/tmp/uploads
+   DATABASE_PATH=/tmp/database.db
+   ```
+   *(Get your free API key at [Groq Console](https://console.groq.com/)).*
+
+3. **Security Note**:
+   - Never commit your `.env` file to GitHub! It is listed in `.gitignore` to protect your API keys.
 
 ---
 
 ## 🚀 Quick Start Guide
 
-### Prerequisites
-- Python 3.9 or higher installed.
-
-### 1. Clone Repository & Navigate
+### 1. Clone the Repository
 ```bash
 git clone https://github.com/VaishnaviSamivel/pdf-study-assistant.git
 cd pdf-study-assistant
 ```
 
-### 2. Create Virtual Environment
+### 2. Set Up Virtual Environment
 ```bash
-# Windows
+# On Windows
 python -m venv venv
 venv\Scripts\activate
 
-# macOS / Linux
+# On macOS/Linux
 python3 -m venv venv
 source venv/bin/activate
 ```
@@ -96,29 +109,32 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Configure Local `.env`
-Copy `.env.example` to `.env` and add your Groq API key from [https://console.groq.com/](https://console.groq.com/).
+### 4. Create `.env` File
+Copy `.env.example` to `.env` and insert your `GROQ_API_KEY`.
 
 ### 5. Run the Local Web Server
 ```bash
 python app.py
 ```
-Open your browser and navigate to `http://127.0.0.1:5000`.
+Open your browser and navigate to:
+```text
+http://127.0.0.1:5000
+```
 
 ---
 
 ## 🌐 Render Cloud Deployment
 
-This repository is optimized for deployment on **Render**:
+This repository is optimized for free production deployment on **Render**:
 
-1. Push your code to GitHub.
-2. Go to [Render.com](https://render.com) -> **New Web Service**.
-3. Connect your repository.
-4. Set deployment configuration:
-   - **Runtime**: `Python 3`
+1. Push your repository to GitHub.
+2. Log in to [Render.com](https://render.com) and create a **New Web Service**.
+3. Connect your repository (`pdf-study-assistant`).
+4. Configure build parameters:
+   - **Environment**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python app.py` (or `gunicorn app:app`)
-5. Add Environment Variables in Render settings:
+   - **Start Command**: `gunicorn app:app`
+5. Add Environment Variables in Render:
    - `GROQ_API_KEY`: `your_actual_groq_api_key`
    - `UPLOAD_FOLDER`: `/tmp/uploads`
    - `DATABASE_PATH`: `/tmp/database.db`
@@ -126,6 +142,32 @@ This repository is optimized for deployment on **Render**:
 
 ---
 
-## 📜 License
+## 📜 Database Schema
+
+The SQLite database (`database.db`) uses two relational tables:
+
+```text
++-----------------------+           +-----------------------+
+|       documents       |           |     chat_history      |
++-----------------------+           +-----------------------+
+| id (PK)               |1       *  | id (PK)               |
+| filename (UNIQUE)     |<----------| doc_id (FK)           |
+| file_path             |           | role ('user'/'bot')   |
+| upload_time           |           | content               |
+| extracted_text        |           | sources_json          |
+| word_count            |           | timestamp             |
+| chunks_json           |           +-----------------------+
++-----------------------+
+```
+
+---
+
+## 🤝 Contributing
+
+Contributions, issues, and feature requests are welcome! Feel free to open an issue or pull request.
+
+---
+
+## 📄 License
 
 This project is open-source under the [MIT License](LICENSE).
