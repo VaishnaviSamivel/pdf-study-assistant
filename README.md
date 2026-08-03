@@ -1,29 +1,53 @@
-# 📚 PDF Study Assistant
+# ⚡ AI-Powered PDF Chatbot using RAG (Flask + Groq LLaMA 3)
 
-An intelligent, full-stack AI-powered study assistant and interactive learning hub built with Python (Flask) and SQLite. Upload any PDF document—Science, Math, History, Computer Science, Law, and more—and instantly generate summary notes, interactive 3D flashcards, timed mock tests, and subject-aware multiple-choice practice quizzes.
-
----
-
-## ✨ Features
-
-- 📄 **PDF Text Extraction**: Reads and parses structured text from uploaded PDF documents using `pypdf`.
-- 💡 **Extractive Summary Notes**: Analyzes document word frequencies to extract top key takeaways and summary points.
-- 🎴 **Interactive 3D Study Flashcards**: 3D flip cards for active recall with intuitive navigation controls (`Flip Card`, `Next`, `Previous`).
-- 🎯 **Smart 100% Dynamic MCQ Generator**: Context-aware exam-style questions for **ANY subject**. All 4 options ($A, B, C, D$) are extracted 100% directly from the uploaded PDF text with zero hardcoded static distractors.
-- ⏱️ **Timed Mock Test Mode**: Practice under pressure with a live 2-minute countdown timer badge and automatic quiz submission upon timeout.
-- 📊 **Score History & Progress Dashboard**: Tracks score percentages, attempt badges, document names, and timestamps for every quiz attempt.
-- 📂 **Multi-Document Library**: Upload multiple PDF files, switch between active study workspaces, or remove documents seamlessly.
-- 🗄️ **Persistent SQLite Storage**: Built-in SQLite database (`database.db`) maintaining separate study data, flashcards, and score history per document across server restarts.
-- 🚀 **Production Ready**: Configured for WSGI servers (`Gunicorn`) and cloud deployment on platforms like Render.
+An interactive, full-stack AI application that transforms uploaded PDF documents into a conversational chatbot ("ChatGPT for PDFs"). Powered by **Flask**, **Groq LLaMA 3 (llama3-8b-8192)**, **RAG (Retrieval-Augmented Generation)**, **`python-dotenv`**, and **SQLite**.
 
 ---
 
-## 🛠️ Technology Stack
+## ✨ Key Features
 
-- **Backend**: Python 3, Flask 3.1.3, SQLite3, PyPDF
-- **Frontend**: HTML5, Vanilla CSS3 (Custom Glassmorphism & 3D Transforms), JavaScript (ES6)
+- ⚡ **Groq LLaMA 3 API Integration**: Uses Groq's high-speed inference engine (`llama3-8b-8192`) via `groq` SDK to generate clear, concise answers.
+- 📄 **Page-Level PDF Extraction & Chunking**: Extracts text page-by-page from PDFs using `pypdf` / `PyPDF2` into overlapping text chunks with page number metadata.
+- 🔍 **RAG Retrieval Engine**: Uses keyword similarity and TF-IDF relevance scoring to retrieve the top 3 most relevant PDF chunks per query.
+- 🛡️ **Strict Context Prompting**: Enforces strict context-only answers: *"Answer ONLY using the provided context. If the answer is not in the context, say 'Not found in document'."*
+- 🔄 **Hybrid Fallback Architecture**: Automatically falls back to an internal extractive QA engine if `GROQ_API_KEY` is not configured or an API error occurs.
+- 💬 **Interactive Chat UI**: Modern dark-theme chat interface with real-time AJAX messaging, "Thinking..." loader, markdown parsing, and expandable **PDF Source Citations** (top 3 chunks).
+- 🗄️ **Persistent SQLite History**: Saves conversation history per document across sessions in SQLite (`database.db`).
+- ☁️ **Render Cloud Ready**: Configured with `/tmp` storage for file uploads and database persistence.
+
+---
+
+## 🛠️ Tech Stack
+
+- **Backend Framework**: Flask 3.1.3, Werkzeug 3.1.8
+- **AI & RAG Engine**: Groq SDK (`groq`), Scikit-Learn, NumPy, PyPDF / PyPDF2
+- **Environment & Utilities**: `python-dotenv`, Requests, Tempfile
+- **Frontend**: HTML5, Vanilla CSS3 (Custom Glassmorphism), JavaScript (ES6, Marked.js)
 - **Production Server**: Gunicorn 23.0.0
-- **Version Control**: Git, GitHub
+
+---
+
+## 🔑 Environment Variables Setup
+
+Create a `.env` file in the root directory (copied from `.env.example`):
+
+```bash
+cp .env.example .env
+```
+
+Add your Groq API key:
+
+```env
+# Groq API Key (Get your free key at: https://console.groq.com/)
+GROQ_API_KEY=your_groq_api_key_here
+
+# Application Configuration
+PORT=5000
+UPLOAD_FOLDER=/tmp/uploads
+DATABASE_PATH=/tmp/database.db
+```
+
+> ⚠️ **Security Rule**: Never commit `.env` to GitHub! It is ignored by `.gitignore`.
 
 ---
 
@@ -31,15 +55,16 @@ An intelligent, full-stack AI-powered study assistant and interactive learning h
 
 ```text
 pdf-study-assistant/
-├── app.py              # Flask server, routes, SQLite DB models & MCQ generator
+├── app.py              # Flask server, RAG retrieval, Groq API integration & routes
 ├── database.db         # Persistent SQLite database (auto-created on startup)
 ├── requirements.txt    # Production dependencies
-├── .gitignore          # Version control ignore rules
+├── .env                # Local secrets file (git-ignored)
+├── .env.example        # Environment variable template for repository
+├── .gitignore          # Git tracking exclusions (.env, *.db, uploads/, __pycache__)
 ├── static/
-│   └── style.css       # Design system, CSS variables, 3D flip transforms & badges
-├── templates/
-│   └── index.html      # Responsive Single-Page Application (SPA) layout
-└── uploads/            # Local PDF file storage directory
+│   └── style.css       # Design system, CSS variables & chat bubbles
+└── templates/
+    └── index.html      # Responsive Chatbot SPA template
 ```
 
 ---
@@ -47,21 +72,21 @@ pdf-study-assistant/
 ## 🚀 Quick Start Guide
 
 ### Prerequisites
-- Python 3.9 or higher installed on your system.
+- Python 3.9 or higher installed.
 
-### 1. Clone the Repository
+### 1. Clone Repository & Navigate
 ```bash
 git clone https://github.com/VaishnaviSamivel/pdf-study-assistant.git
 cd pdf-study-assistant
 ```
 
-### 2. Create a Virtual Environment (Optional but Recommended)
+### 2. Create Virtual Environment
 ```bash
-# On Windows
+# Windows
 python -m venv venv
 venv\Scripts\activate
 
-# On macOS/Linux
+# macOS / Linux
 python3 -m venv venv
 source venv/bin/activate
 ```
@@ -71,64 +96,36 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Run the Local Web Server
+### 4. Configure Local `.env`
+Copy `.env.example` to `.env` and add your Groq API key from [https://console.groq.com/](https://console.groq.com/).
+
+### 5. Run the Local Web Server
 ```bash
 python app.py
 ```
-
-Open your browser and navigate to:
-```text
-http://127.0.0.1:5000
-```
+Open your browser and navigate to `http://127.0.0.1:5000`.
 
 ---
 
-## 🌐 Cloud Deployment (Render.com)
+## 🌐 Render Cloud Deployment
 
-This repository is pre-configured for free cloud deployment on **Render**:
+This repository is optimized for deployment on **Render**:
 
-1. Push your repository to GitHub.
-2. Log in to [Render.com](https://render.com) and create a **New Web Service**.
-3. Connect your `pdf-study-assistant` GitHub repository.
-4. Set the build parameters:
-   - **Environment**: `Python 3`
+1. Push your code to GitHub.
+2. Go to [Render.com](https://render.com) -> **New Web Service**.
+3. Connect your repository.
+4. Set deployment configuration:
+   - **Runtime**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `gunicorn app:app`
-5. Click **Create Web Service**. Render will build and launch your live application URL!
+   - **Start Command**: `python app.py` (or `gunicorn app:app`)
+5. Add Environment Variables in Render settings:
+   - `GROQ_API_KEY`: `your_actual_groq_api_key`
+   - `UPLOAD_FOLDER`: `/tmp/uploads`
+   - `DATABASE_PATH`: `/tmp/database.db`
+6. Click **Deploy Web Service**.
 
 ---
 
-## 📜 Database Schema
+## 📜 License
 
-The SQLite database (`database.db`) uses two relational tables:
-
-```text
-+-----------------------+           +-----------------------+
-|       documents       |           |     quiz_attempts     |
-+-----------------------+           +-----------------------+
-| id (PK)               |1       *  | id (PK)               |
-| filename (UNIQUE)     |<----------| doc_id (FK)           |
-| file_path             |           | score                 |
-| upload_time           |           | total                 |
-| extracted_text        |           | percentage            |
-| summary_notes         |           | timestamp             |
-| quiz_questions        |           | filename              |
-| flashcards            |           +-----------------------+
-| word_count            |
-| submitted             |
-| user_answers          |
-| score                 |
-+-----------------------+
-```
-
----
-
-## 🤝 Contributing
-
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/VaishnaviSamivel/pdf-study-assistant/issues).
-
----
-
-## 📄 License
-
-This project is open-source and available under the [MIT License](LICENSE).
+This project is open-source under the [MIT License](LICENSE).

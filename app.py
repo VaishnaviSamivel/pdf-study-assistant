@@ -2,42 +2,73 @@ import os
 import re
 import json
 import sqlite3
+import tempfile
+import requests
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash, session
+from dotenv import load_dotenv
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
 from werkzeug.utils import secure_filename
 from pypdf import PdfReader
 
-# Initialize the Flask application
+# Load local environment variables from .env file
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Groq SDK Import
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+# Google Generative AI (Gemini) SDK
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+# Initialize Flask Application
 app = Flask(__name__)
 
-# Secret key required for Flask session management and flash messages (uses env var if provided)
-app.secret_key = os.environ.get("SECRET_KEY", "learning-pdf-app-secret-key")
+# Secret key required for Flask session management
+app.secret_key = os.environ.get("SECRET_KEY", "pdf-chatbot-study-assistant-secret-key")
 
-# Define the folder where uploaded files will be stored locally
-UPLOAD_FOLDER = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'uploads')
+# Upload folder configuration (defaults to /tmp on Render for cloud compatibility)
+FALLBACK_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), 'pdf_chatbot_uploads')
+UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", FALLBACK_UPLOAD_DIR)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Set maximum file upload size limit (16 MB)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+# Set maximum file upload size limit to 5MB
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB limit
 
-# Ensure the upload folder exists on server startup
+# Ensure upload directory exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Path to the local SQLite database file
-DB_PATH = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'database.db')
+# SQLite Database Path configuration (defaults to /tmp on Render)
+FALLBACK_DB_PATH = os.path.join(tempfile.gettempdir(), 'pdf_chatbot.db')
+DB_PATH = os.environ.get("DATABASE_PATH", FALLBACK_DB_PATH)
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    """Handles file uploads exceeding 5MB max content length."""
+    flash("File too large. Please upload a PDF under 5MB.", "error")
+    return redirect(url_for("index"))
 
 def get_db_connection():
     """Establishes and returns a connection to the SQLite database."""
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Enables dictionary-style column access
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Creates SQLite database tables if they do not exist."""
+    """Creates SQLite database tables for documents and chat history if they do not exist."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Documents table: stores file info, extracted text, summary, quiz & flashcards
+    # 1. Documents table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,26 +76,20 @@ def init_db():
             file_path TEXT NOT NULL,
             upload_time TEXT NOT NULL,
             extracted_text TEXT,
-            summary_notes TEXT,
-            quiz_questions TEXT,
-            flashcards TEXT,
             word_count INTEGER,
-            submitted INTEGER DEFAULT 0,
-            user_answers TEXT DEFAULT '{}',
-            score INTEGER DEFAULT 0
+            chunks_json TEXT
         )
     ''')
     
-    # 2. Quiz attempts table: stores score history linked to a document via doc_id
+    # 2. Chat history table linked to documents
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS quiz_attempts (
+        CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             doc_id INTEGER NOT NULL,
-            score INTEGER NOT NULL,
-            total INTEGER NOT NULL,
-            percentage INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            sources_json TEXT,
             timestamp TEXT NOT NULL,
-            filename TEXT NOT NULL,
             FOREIGN KEY (doc_id) REFERENCES documents (id) ON DELETE CASCADE
         )
     ''')
@@ -72,480 +97,376 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Initialize database on app startup
+# Initialize DB schema on server startup
 init_db()
 
-# Helper function to check if the uploaded file has a PDF extension
 def is_pdf(filename):
+    """Checks if the filename has a .pdf extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() == 'pdf'
 
-# Helper function to extract text content from a PDF file
-def extract_text_from_pdf(file_path):
+def extract_pdf_pages_and_chunks(file_path, chunk_size=700, chunk_overlap=120):
     """
-    Reads a PDF file using pypdf and extracts text from each page.
+    Extracts text from PDF page by page using pypdf and builds overlapping text chunks
+    with page number metadata for RAG retrieval.
     """
     try:
         reader = PdfReader(file_path)
-        extracted_pages = []
+        full_text_list = []
+        chunks = []
+        chunk_counter = 1
         
-        for page_num, page in enumerate(reader.pages, start=1):
+        for page_idx, page in enumerate(reader.pages, start=1):
             page_text = page.extract_text()
-            if page_text and page_text.strip():
-                extracted_pages.append(f"--- Page {page_num} ---\n{page_text.strip()}")
-        
-        if not extracted_pages:
-            return "No readable text found in this PDF document (it may contain scanned images or empty pages)."
+            if not page_text or not page_text.strip():
+                continue
             
-        return "\n\n".join(extracted_pages)
+            cleaned_page_text = re.sub(r'\s+', ' ', page_text).strip()
+            full_text_list.append(f"--- Page {page_idx} ---\n{cleaned_page_text}")
+            
+            # Divide page text into overlapping windows
+            start = 0
+            text_len = len(cleaned_page_text)
+            
+            while start < text_len:
+                end = start + chunk_size
+                chunk_str = cleaned_page_text[start:end]
+                
+                # Trim to word boundary
+                if end < text_len and ' ' in chunk_str[-20:]:
+                    last_space = chunk_str.rfind(' ')
+                    chunk_str = chunk_str[:last_space]
+                    end = start + len(chunk_str)
+                
+                if len(chunk_str.strip()) > 30:
+                    chunks.append({
+                        "id": chunk_counter,
+                        "page": page_idx,
+                        "text": chunk_str.strip()
+                    })
+                    chunk_counter += 1
+                
+                start = end - chunk_overlap
+                if start >= text_len or end >= text_len:
+                    break
+                    
+        full_text = "\n\n".join(full_text_list)
+        word_count = len(full_text.split())
+        
+        if not chunks and full_text:
+            chunks.append({"id": 1, "page": 1, "text": full_text[:1000]})
+            
+        return full_text, chunks, word_count
     
     except Exception as e:
-        return f"Error reading PDF file: {str(e)}"
+        print(f"Error extracting PDF text: {e}")
+        return f"Error reading PDF file: {str(e)}", [], 0
 
-# Simple, beginner-friendly text summarizer function (Pure Python)
-def generate_summary_notes(text):
+def retrieve_relevant_chunks(query, chunks, top_k=3):
     """
-    Generates concise summary notes from text using word-frequency sentence scoring.
+    RAG Retrieval Engine: Computes relevance scores for each chunk
+    and returns top_k (max 3 chunks only) most relevant text chunks.
     """
-    if not text or "No readable text found" in text or "Error reading" in text:
-        return ["No summary notes available for this document."]
-    
-    raw_sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = [s.strip() for s in raw_sentences if len(s.strip().split()) > 4 and not s.startswith('--- Page')]
-    
-    if not sentences:
-        return ["The document text is too short to generate summary notes."]
+    if not chunks or not query.strip():
+        return []
     
     stop_words = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
         'by', 'from', 'is', 'was', 'are', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
         'it', 'its', 'this', 'that', 'these', 'those', 'as', 'which', 'who', 'whom', 'will',
-        'would', 'can', 'could', 'should', 'than', 'then', 'so', 'if', 'not', 'no', 'all', 'any'
+        'would', 'can', 'could', 'should', 'than', 'then', 'so', 'if', 'not', 'no', 'all', 'any',
+        'what', 'how', 'why', 'where', 'when', 'tell', 'me', 'about', 'explain', 'give'
     }
     
-    words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-    word_freq = {}
-    for word in words:
-        if word not in stop_words:
-            word_freq[word] = word_freq.get(word, 0) + 1
-            
-    if not word_freq:
-        return sentences[:3]
+    query_clean = re.sub(r'[^\w\s]', ' ', query.lower())
+    query_tokens = [w for w in query_clean.split() if w not in stop_words and len(w) > 2]
     
-    scored_sentences = []
-    for idx, sentence in enumerate(sentences):
-        sentence_words = re.findall(r'\b[a-zA-Z]{3,}\b', sentence.lower())
-        score = sum(word_freq.get(w, 0) for w in sentence_words)
-        normalized_score = score / (len(sentence_words) + 1)
-        scored_sentences.append((normalized_score, idx, sentence))
+    if not query_tokens:
+        query_tokens = [w for w in query_clean.split() if len(w) > 1]
         
-    num_notes = min(max(3, len(sentences) // 3), 5)
-    top_sentences = sorted(scored_sentences, key=lambda item: item[0], reverse=True)[:num_notes]
-    top_sentences.sort(key=lambda item: item[1])
+    scored_chunks = []
     
-    return [item[2] for item in top_sentences]
-
-# Simple, beginner-friendly Multiple-Choice Question (MCQ) Generator (Pure Python)
-import random
-
-def extract_all_pdf_concepts(text):
-    """
-    Extracts all key terms, subjects, and concepts directly from ANY PDF text.
-    No hardcoded lists or static fallbacks used.
-    """
-    if not text:
-        return []
-
-    concepts = []
-    seen = set()
-
-    # 1. Extract subjects/terms matching subject-verb patterns in sentences
-    raw_sentences = re.split(r'(?<=[.!?])\s+', text)
-    for s in raw_sentences:
-        m = re.search(r'\b([A-Z][a-zA-Z0-9\s]{1,30})\b\s+(is|are|enables|provides|uses|requires|allows|helps|creates|includes|refers to|means|breaks down|break down|converts|produces|contains|stores|absorbs|forms|consists of)\b', s, flags=re.IGNORECASE)
-        if m:
-            term = m.group(1).strip()
-            term = re.sub(r'^(a|an|the)\s+', '', term, flags=re.IGNORECASE).strip()
-            term = re.sub(r'\b(\w+)\s+\1\b', r'\1', term, flags=re.IGNORECASE).capitalize()
-            if len(term.split()) <= 3 and len(term) >= 3 and term.lower() not in seen:
-                seen.add(term.lower())
-                concepts.append(term)
-
-    # 2. Extract capitalized terms & prominent nouns from text
-    words = re.findall(r'\b[A-Z][a-zA-Z0-9-]{2,}\b', text)
-    stop_words = {
-        'this', 'that', 'these', 'those', 'with', 'from', 'have', 'has', 'had', 'which', 'where', 
-        'when', 'what', 'they', 'their', 'them', 'some', 'other', 'into', 'only', 'also', 'than', 
-        'then', 'about', 'each', 'such', 'page', 'type', 'main', 'text', 'first', 'second', 'well', 
-        'like', 'back', 'down', 'over', 'more', 'most', 'very', 'living', 'things', 'make', 'using', 
-        'used', 'were', 'been', 'being', 'does', 'did', 'done', 'will', 'would', 'could', 'should'
-    }
-
-    for w in words:
-        w_clean = re.sub(r'^(a|an|the)\s+', '', w, flags=re.IGNORECASE).strip().capitalize()
-        if w_clean.lower() not in stop_words and len(w_clean) >= 3 and w_clean.lower() not in seen:
-            seen.add(w_clean.lower())
-            concepts.append(w_clean)
-
-    # 3. If concepts are sparse, extract key 2-3 word phrases from sentences
-    if len(concepts) < 4:
-        for s in raw_sentences:
-            s_clean = s.strip()
-            if len(s_clean.split()) >= 4:
-                phrase = ' '.join(s_clean.split()[:3]).rstrip(',.!?').capitalize()
-                if phrase.lower() not in seen and len(phrase) >= 3:
-                    seen.add(phrase.lower())
-                    concepts.append(phrase)
-
-    return concepts
-
-def generate_mcqs(text, difficulty="medium"):
-    """
-    100% Dynamic MCQ Generator for ANY subject PDF.
-    - Zero hardcoded fallback lists or static distractors.
-    - All 4 options come 100% from the uploaded PDF text.
-    - Context-aware for Science, Math, English, History, Law, CS, etc.
-    """
-    if not text or "No readable text found" in text or "Error reading" in text:
-        text = ""
-
-    # Extract all concepts/terms directly from the PDF text
-    pdf_concepts = extract_all_pdf_concepts(text)
-
-    raw_sentences = re.split(r'(?<=[.!?])\s+', text)
-    sentences = []
-    for s in raw_sentences:
-        s_clean = s.strip()
-        if len(s_clean.split()) >= 5 and not s_clean.startswith('--- Page'):
-            s_clean = re.sub(r'\b(\w+)\s+\1\b', r'\1', s_clean, flags=re.IGNORECASE)
-            sentences.append(s_clean)
-
-    mcq_list = []
-    option_letters = ['A', 'B', 'C', 'D']
-    used_answers = set()
-
-    for sentence in sentences:
-        if len(mcq_list) >= 5:
-            break
-
-        match = re.search(r'\b([A-Z][a-zA-Z0-9\s]{1,30})\b\s+(is|are|enables|provides|uses|requires|allows|helps|creates|includes|refers to|means|breaks down|break down|converts|produces|contains|stores|absorbs|forms|consists of)\b\s+(.+)', sentence, flags=re.IGNORECASE)
-
-        if match:
-            target_term = match.group(1).strip()
-            target_term = re.sub(r'^(a|an|the)\s+', '', target_term, flags=re.IGNORECASE).strip()
-            target_term = re.sub(r'\b(\w+)\s+\1\b', r'\1', target_term, flags=re.IGNORECASE).capitalize()
-            verb = match.group(2).strip().lower()
-            rest = match.group(3).strip().rstrip('.!?')
-
-            if target_term.lower() in used_answers or len(target_term) < 3:
-                continue
-
-            used_answers.add(target_term.lower())
-            correct_answer = target_term
-
-            if verb in ['is', 'are']:
-                question_text = f"Which term describes {rest}?"
-            elif verb in ['refers to', 'means']:
-                question_text = f"Which term refers to {rest}?"
-            elif verb in ['break down', 'breaks down']:
-                question_text = f"Which organisms or factors break down {rest}?"
-            elif verb in ['converts', 'convert']:
-                question_text = f"What process is responsible for converting {rest}?"
-            elif verb in ['absorbs', 'absorb']:
-                question_text = f"Which component or substance absorbs {rest}?"
-            else:
-                question_text = f"Which key concept {verb} {rest}?"
-        else:
-            words = sentence.split()
-            if len(words) < 5:
-                continue
-            cand_term = words[0].capitalize().rstrip(',.!?')
-            cand_term = re.sub(r'^(a|an|the)\s+', '', cand_term, flags=re.IGNORECASE).strip().capitalize()
-            if cand_term.lower() in used_answers or len(cand_term) < 3:
-                continue
-
-            used_answers.add(cand_term.lower())
-            correct_answer = cand_term
-            rest_sentence = ' '.join(words[1:]).rstrip('.!?')
-            question_text = f"Which term is associated with {rest_sentence}?"
-
-        # Build 3 distractors ONLY from pdf_concepts (extracted 100% from THIS PDF!)
-        distractors = []
-        for concept in pdf_concepts:
-            if concept.lower() != correct_answer.lower() and concept.lower() not in [d.lower() for d in distractors]:
-                distractors.append(concept)
-                if len(distractors) == 3:
-                    break
-
-        # If PDF is very short and has <3 other concepts, extract short phrase predicates from other sentences
-        if len(distractors) < 3:
-            for s in sentences:
-                if s != sentence:
-                    words = s.split()
-                    if len(words) >= 3:
-                        phrase = ' '.join(words[:2]).capitalize()
-                        if phrase.lower() != correct_answer.lower() and phrase.lower() not in [d.lower() for d in distractors]:
-                            distractors.append(phrase)
-                            if len(distractors) == 3:
-                                break
-
-        # Shuffle correct answer + 3 PDF distractors
-        raw_options = [correct_answer] + distractors[:3]
-        random.shuffle(raw_options)
-
-        correct_index = raw_options.index(correct_answer)
-        correct_letter = option_letters[correct_index]
-
-        formatted_options = [f"{option_letters[i]}) {raw_options[i]}" for i in range(4)]
-
-        mcq_list.append({
-            'question_number': len(mcq_list) + 1,
-            'question': question_text,
-            'options': formatted_options,
-            'correct_letter': correct_letter,
-            'correct_text': correct_answer
-        })
-
-    return mcq_list[:5]
-
-
-
-
-
-# Simple, beginner-friendly Flashcard Generator (Pure Python)
-def generate_flashcards(text):
-    """
-    Generates 5 study flashcards from extracted PDF text.
-    """
-    flashcards = []
-    
-    if text and "No readable text found" not in text and "Error reading" not in text:
-        raw_sentences = re.split(r'(?<=[.!?])\s+', text)
-        sentences = [s.strip() for s in raw_sentences if len(s.strip().split()) > 4 and not s.startswith('--- Page')]
+    for chunk in chunks:
+        chunk_text_lower = chunk['text'].lower()
+        score = 0.0
         
-        for sentence in sentences:
-            if len(flashcards) >= 5:
-                break
+        # Exact phrase match bonus
+        if len(query.strip()) > 5 and query.strip().lower() in chunk_text_lower:
+            score += 15.0
             
-            words = sentence.split()
-            if len(words) < 5:
-                continue
+        # Token frequency scoring
+        for token in query_tokens:
+            count = len(re.findall(r'\b' + re.escape(token) + r'\b', chunk_text_lower))
+            if count > 0:
+                score += (count * 3.0) + 1.0
+            elif token in chunk_text_lower:
+                score += 0.5
                 
-            subject_match = re.search(r'\b([A-Z][a-zA-Z0-9\s]{1,25})\b\s+(is|are|allows|enables|helps|provides|requires|uses)\b', sentence)
+        if score > 0:
+            scored_chunks.append((score, chunk))
             
-            if subject_match:
-                subject = subject_match.group(1).strip()
-                verb = subject_match.group(2).strip()
-                rest = sentence.split(subject_match.group(0))[-1].strip()
-                
-                front_text = f"What is the definition or role of '{subject}'?"
-                back_text = f"According to the text: {subject} {verb} {rest.rstrip('.!?')}."
-            else:
-                front_text = f"Explain Key Concept: '{sentence[:50]}...'" if len(sentence) > 50 else f"Explain Key Concept: '{sentence}'"
-                back_text = sentence.rstrip('.!?') + '.'
-                
-            flashcards.append({
-                'id': len(flashcards) + 1,
-                'front': front_text,
-                'back': back_text
-            })
-            
-    fallbacks = [
-        ("What is the main purpose of this PDF study tool?", "To extract text, summarize key points, generate quiz questions, and provide study flashcards."),
-        ("How are PDF documents processed locally?", "The Python Flask server saves the PDF file to an 'uploads' folder and reads text using pypdf."),
-        ("What makes a sentence important for summary notes?", "Sentences containing frequent document keywords receive higher importance scores."),
-        ("How do study flashcards help learners?", "Flashcards enable active recall by testing memory on the front side before revealing the answer on the back."),
-        ("What format is used for the practice quiz?", "Multiple-choice questions (MCQs) with 4 options and immediate score evaluation.")
-    ]
+    scored_chunks.sort(key=lambda x: x[0], reverse=True)
+    selected_chunks = [item[1] for item in scored_chunks[:top_k]]
     
-    fb_idx = 0
-    while len(flashcards) < 5 and fb_idx < len(fallbacks):
-        front, back = fallbacks[fb_idx]
-        flashcards.append({
-            'id': len(flashcards) + 1,
-            'front': front,
-            'back': back
-        })
-        fb_idx += 1
+    # Fallback if no exact keyword match: return first top_k chunks
+    if not selected_chunks and chunks:
+        selected_chunks = chunks[:top_k]
         
-    return flashcards[:5]
+    return selected_chunks[:3]
 
-def format_doc_row(row):
-    """Formats a database document row into a template-friendly dictionary."""
-    if not row:
+def generate_groq_answer(question, context_chunks):
+    """
+    Generates a natural language answer using Groq API (llama3-8b-8192) based strictly on retrieved PDF context.
+    Returns None if GROQ_API_KEY is missing or API call fails.
+    """
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key or groq_key == "your_key_here" or not Groq:
         return None
-    return {
-        'id': row['id'],
-        'filename': row['filename'],
-        'file_path': row['file_path'],
-        'upload_time': row['upload_time'],
-        'extracted_text': row['extracted_text'],
-        'summary_notes': json.loads(row['summary_notes']) if row['summary_notes'] else [],
-        'quiz_questions': json.loads(row['quiz_questions']) if row['quiz_questions'] else [],
-        'flashcards': json.loads(row['flashcards']) if row['flashcards'] else [],
-        'word_count': row['word_count'],
-        'submitted': bool(row['submitted']),
-        'user_answers': json.loads(row['user_answers']) if row['user_answers'] else {},
-        'score': row['score']
-    }
+        
+    if not context_chunks:
+        return "No relevant content found in document"
+        
+    try:
+        # Combine top 3 retrieved chunks into a single context string
+        context_str = "\n\n".join([f"[Page {c['page']}]: {c['text']}" for c in context_chunks[:3]])
+        
+        # Limit context length to 4000 characters max
+        if len(context_str) > 4000:
+            context_str = context_str[:4000] + "..."
+            
+        client = Groq(api_key=groq_key)
+        
+        system_prompt = (
+            "You are a helpful assistant. Answer ONLY using the provided context. "
+            "If the answer is not in the context, say 'Not found in document'. "
+            "Do not make up information."
+        )
+        
+        user_content = f"Context:\n{context_str}\n\nQuestion: {question}"
+        
+        # Groq model list: try llama-3.1-8b-instant or fallback to llama-3.3-70b-versatile
+        model_name = "llama-3.1-8b-instant"
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.3,
+                max_tokens=600
+            )
+        except Exception:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.3,
+                max_tokens=600
+            )
+        
+        if response and response.choices and len(response.choices) > 0:
+            return response.choices[0].message.content.strip()
+            
+    except Exception as err:
+        print(f"Groq API Error: {err}")
+        
+    return None
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    init_db()  # Ensure SQLite database tables exist
+def generate_gemini_answer(question, context_chunks):
+    """
+    Generates a natural language answer using Google Gemini API based strictly on the retrieved PDF context.
+    If context does not contain the answer, returns 'Not found in document'.
+    """
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key or gemini_key == "your_gemini_api_key_here" or not genai:
+        return None
+        
+    try:
+        genai.configure(api_key=gemini_key)
+        
+        context_str = "\n\n".join([f"[Page {c['page']}]: {c['text']}" for c in context_chunks])
+        
+        prompt = (
+            "You are an AI PDF assistant. Answer the user question based ONLY on the provided PDF context below.\n\n"
+            "Strict Rules:\n"
+            "1. Answer ONLY using facts directly mentioned in the provided context.\n"
+            "2. Do NOT assume, extrapolate, or use outside knowledge.\n"
+            "3. If the answer cannot be found in the provided context, reply EXACTLY with: \"Not found in document\".\n\n"
+            f"PDF Context:\n{context_str}\n\n"
+            f"User Question: {question}\n\n"
+            "Answer:"
+        )
+        
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        
+        if response and response.text:
+            return response.text.strip()
+            
+    except Exception as err:
+        print(f"Gemini API Error: {err}")
+        
+    return None
+
+def generate_fallback_extractive_answer(question, relevant_chunks):
+    """
+    Generates a structured extractive answer from retrieved PDF chunks when LLM API is unavailable or fails.
+    """
+    if not relevant_chunks:
+        return "Not found in document"
     
-    if request.method == 'POST':
-        if 'file' not in request.files:
-            flash('No file part found in the request.', 'error')
-            return redirect(request.url)
+    question_lower = question.lower()
+    is_summary_req = any(w in question_lower for w in ['summary', 'summarize', 'overview', 'main point', 'about'])
+    
+    output_lines = []
+    
+    if is_summary_req:
+        output_lines.append("### 📋 Document Summary Overview\n")
+        output_lines.append("Based on the relevant sections of your PDF document:\n")
+        for chunk in relevant_chunks:
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk['text']) if len(s.strip()) > 15]
+            if sentences:
+                output_lines.append(f"- **Page {chunk['page']}**: {sentences[0]}")
+    else:
+        output_lines.append(f"### 🔍 Context Excerpts for: *\"{question}\"*\n")
+        for idx, chunk in enumerate(relevant_chunks, start=1):
+            sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk['text']) if len(s.strip()) > 15]
+            key_excerpt = " ".join(sentences[:3]) if sentences else chunk['text']
+            output_lines.append(f"**Section {idx} (Page {chunk['page']})**:")
+            output_lines.append(f"> \"{key_excerpt}\"\n")
+            
+        output_lines.append("*💡 Note: Set `GROQ_API_KEY` in your .env file to enable Groq LLaMA 3 AI responses.*")
         
-        file = request.files['file']
-        
-        if file.filename == '':
-            flash('Please select a PDF file to upload.', 'error')
-            return redirect(request.url)
-        
-        if file and is_pdf(file.filename):
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            
-            # Save PDF file locally
-            file.save(file_path)
-            
-            # Process PDF: Extract text, summary, quiz, and flashcards
-            extracted_text = extract_text_from_pdf(file_path)
-            summary_notes = generate_summary_notes(extracted_text)
-            quiz_questions = generate_mcqs(extracted_text)
-            flashcards = generate_flashcards(extracted_text)
-            word_count = len(extracted_text.split())
-            upload_time = datetime.now().strftime('%b %d, %Y at %I:%M %p')
-            
-            # Save / Update entry in SQLite database
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO documents 
-                (filename, file_path, upload_time, extracted_text, summary_notes, quiz_questions, flashcards, word_count, submitted, user_answers, score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '{}', 0)
-                ON CONFLICT(filename) DO UPDATE SET
-                    file_path=excluded.file_path,
-                    upload_time=excluded.upload_time,
-                    extracted_text=excluded.extracted_text,
-                    summary_notes=excluded.summary_notes,
-                    quiz_questions=excluded.quiz_questions,
-                    flashcards=excluded.flashcards,
-                    word_count=excluded.word_count,
-                    submitted=0,
-                    user_answers='{}',
-                    score=0
-            ''', (
-                filename, file_path, upload_time, extracted_text,
-                json.dumps(summary_notes), json.dumps(quiz_questions),
-                json.dumps(flashcards), word_count
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-            session['active_filename'] = filename
-            flash(f"Uploaded '{filename}'! Saved permanently in SQLite database.", 'success')
-            return redirect(url_for('index'))
-        else:
-            flash('Invalid file type! Only PDF files (.pdf) are allowed.', 'error')
-            return redirect(request.url)
+    return "\n".join(output_lines)
 
-    # GET Request: Fetch all documents & active document data from SQLite database
+def generate_llm_answer(question, relevant_chunks, chat_history=[]):
+    """
+    Hybrid System:
+    1. If GROQ_API_KEY is available -> call Groq API (llama3-8b-8192) with top 3 chunks.
+    2. Else -> try Gemini API if available.
+    3. Else (or if API calls fail) -> fallback to existing extractive QA system.
+    """
+    top_chunks = relevant_chunks[:3]
+    
+    # 1. Try Groq API
+    groq_answer = generate_groq_answer(question, top_chunks)
+    if groq_answer:
+        return groq_answer
+        
+    # 2. Try Gemini API
+    gemini_answer = generate_gemini_answer(question, top_chunks)
+    if gemini_answer:
+        return gemini_answer
+        
+    # 3. Fallback to Extractive QA
+    return generate_fallback_extractive_answer(question, top_chunks)
+
+# Flask Web Routes
+
+@app.route('/')
+def index():
+    """Main Chat UI route."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute('SELECT filename, word_count, upload_time FROM documents ORDER BY id DESC')
+    cursor.execute('SELECT id, filename, word_count, upload_time FROM documents ORDER BY id DESC')
     doc_rows = cursor.fetchall()
-    documents = {row['filename']: dict(row) for row in doc_rows}
+    documents = [dict(row) for row in doc_rows]
     
     active_filename = session.get('active_filename')
     if not active_filename and documents:
-        active_filename = list(documents.keys())[0]
+        active_filename = documents[0]['filename']
         session['active_filename'] = active_filename
         
     active_doc = None
-    score_history = []
+    chat_messages = []
     
     if active_filename:
         cursor.execute('SELECT * FROM documents WHERE filename = ?', (active_filename,))
         doc_row = cursor.fetchone()
         if doc_row:
-            active_doc = format_doc_row(doc_row)
-            cursor.execute('SELECT * FROM quiz_attempts WHERE doc_id = ? ORDER BY id ASC', (active_doc['id'],))
-            attempt_rows = cursor.fetchall()
-            score_history = [dict(r) for r in attempt_rows]
-            
+            active_doc = dict(doc_row)
+            cursor.execute('SELECT * FROM chat_history WHERE doc_id = ? ORDER BY id ASC', (active_doc['id'],))
+            msg_rows = cursor.fetchall()
+            for msg in msg_rows:
+                msg_dict = dict(msg)
+                msg_dict['sources'] = json.loads(msg_dict['sources_json']) if msg_dict['sources_json'] else []
+                chat_messages.append(msg_dict)
+                
     conn.close()
     
-    if not active_doc:
-        active_doc = {}
-
-    return render_template('index.html', 
-                           documents=documents,
-                           active_filename=active_filename,
-                           extracted_text=active_doc.get('extracted_text'), 
-                           summary_notes=active_doc.get('summary_notes'), 
-                           quiz_questions=active_doc.get('quiz_questions'),
-                           flashcards=active_doc.get('flashcards'),
-                           filename=active_doc.get('filename'),
-                           word_count=active_doc.get('word_count', 0),
-                           submitted=active_doc.get('submitted', False),
-                           score=active_doc.get('score', 0),
-                           user_answers=active_doc.get('user_answers', {}),
-                           score_history=score_history)
-
-@app.route('/select_doc/<path:filename>')
-def select_doc(filename):
-    """Switches the active study document to the selected PDF filename."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT filename FROM documents WHERE filename = ?', (filename,))
-    row = cursor.fetchone()
-    conn.close()
+    has_api = bool(
+        (os.getenv("GROQ_API_KEY") and os.getenv("GROQ_API_KEY") != "your_key_here") or
+        (os.getenv("GEMINI_API_KEY") and os.getenv("GEMINI_API_KEY") != "your_gemini_api_key_here")
+    )
     
-    if row:
-        session['active_filename'] = filename
-        flash(f"Switched study document to '{filename}'.", 'info')
-    else:
-        flash(f"Document '{filename}' not found in database.", 'error')
-        
-    return redirect(url_for('index'))
+    return render_template(
+        'index.html',
+        documents=documents,
+        active_filename=active_filename,
+        active_doc=active_doc,
+        chat_messages=chat_messages,
+        has_api_key=has_api
+    )
 
-@app.route('/delete_doc/<path:filename>', methods=['POST'])
-def delete_doc(filename):
-    """Deletes a document and its linked score history from SQLite database."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT id FROM documents WHERE filename = ?', (filename,))
-    row = cursor.fetchone()
-    
-    if row:
-        doc_id = row['id']
-        cursor.execute('DELETE FROM quiz_attempts WHERE doc_id = ?', (doc_id,))
-        cursor.execute('DELETE FROM documents WHERE id = ?', (doc_id,))
-        conn.commit()
-        
-        if session.get('active_filename') == filename:
-            cursor.execute('SELECT filename FROM documents ORDER BY id DESC LIMIT 1')
-            rem = cursor.fetchone()
-            session['active_filename'] = rem['filename'] if rem else None
-            
-        flash(f"Deleted document '{filename}' from SQLite database.", 'info')
-        
-    conn.close()
-    return redirect(url_for('index'))
-
-@app.route('/submit_quiz', methods=['POST'])
-def submit_quiz():
-    """Handles quiz submission and stores attempt permanently in SQLite database."""
-    active_filename = session.get('active_filename')
-    
-    if not active_filename:
-        flash('No active study document selected. Please upload a PDF first.', 'error')
+@app.route('/upload', methods=['POST'])
+def upload_pdf():
+    """Handles PDF file upload, text extraction, chunking, and SQLite storage."""
+    if 'file' not in request.files:
+        flash('No file part in the request.', 'error')
         return redirect(url_for('index'))
+        
+    file = request.files['file']
+    if file.filename == '':
+        flash('Please select a PDF file to upload.', 'error')
+        return redirect(url_for('index'))
+        
+    if file and is_pdf(file.filename):
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        extracted_text, chunks, word_count = extract_pdf_pages_and_chunks(file_path)
+        upload_time = datetime.now().strftime('%b %d, %Y at %I:%M %p')
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO documents (filename, file_path, upload_time, extracted_text, word_count, chunks_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(filename) DO UPDATE SET
+                file_path=excluded.file_path,
+                upload_time=excluded.upload_time,
+                extracted_text=excluded.extracted_text,
+                word_count=excluded.word_count,
+                chunks_json=excluded.chunks_json
+        ''', (filename, file_path, upload_time, extracted_text, word_count, json.dumps(chunks)))
+        
+        conn.commit()
+        conn.close()
+        
+        session['active_filename'] = filename
+        flash(f"Uploaded '{filename}'! Processed {word_count} words into {len(chunks)} searchable chunks.", 'success')
+        return redirect(url_for('index'))
+    else:
+        flash('Invalid file type! Please upload a valid .pdf file.', 'error')
+        return redirect(url_for('index'))
+
+@app.route('/api/chat', methods=['POST'])
+def chat_api():
+    """AJAX Chat endpoint: accepts question, retrieves top 3 chunks, calls hybrid LLM/extractive system."""
+    data = request.get_json() or {}
+    user_message = data.get('message', '').strip()
+    
+    if not user_message:
+        return jsonify({"answer": "Please enter a valid question", "sources": []}), 400
+        
+    active_filename = session.get('active_filename')
+    if not active_filename:
+        return jsonify({"answer": "No active PDF selected. Please upload a PDF first.", "sources": []}), 400
         
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -554,86 +475,104 @@ def submit_quiz():
     
     if not doc_row:
         conn.close()
-        flash('Active document not found in database.', 'error')
-        return redirect(url_for('index'))
+        return jsonify({"answer": "Active document not found in database.", "sources": []}), 404
         
     doc_id = doc_row['id']
-    quiz_questions = json.loads(doc_row['quiz_questions']) if doc_row['quiz_questions'] else []
+    chunks = json.loads(doc_row['chunks_json']) if doc_row['chunks_json'] else []
     
-    score = 0
-    user_answers = {}
+    # 1. Retrieve top 3 relevant chunks
+    relevant_chunks = retrieve_relevant_chunks(user_message, chunks, top_k=3)[:3]
     
-    for mcq in quiz_questions:
-        q_num = str(mcq['question_number'])
-        selected_option = request.form.get(f'q_{q_num}')
-        user_answers[q_num] = selected_option
-        
-        if selected_option == mcq['correct_letter']:
-            score += 1
-            
-    total_q = len(quiz_questions)
-    percentage = int((score / total_q) * 100) if total_q > 0 else 0
-    timestamp = datetime.now().strftime('%b %d, %Y at %I:%M %p')
+    # 2. Fetch recent conversation history
+    cursor.execute('SELECT role, content FROM chat_history WHERE doc_id = ? ORDER BY id DESC LIMIT 6', (doc_id,))
+    history_rows = cursor.fetchall()
+    history = [dict(r) for r in reversed(history_rows)]
     
-    # Update active document submission status in SQLite database
+    # 3. Generate answer via Hybrid system (Groq -> Gemini -> Fallback QA)
+    answer = generate_llm_answer(user_message, relevant_chunks, chat_history=history)
+    timestamp = datetime.now().strftime('%I:%M %p')
+    
+    # Prepare top 3 source citations
+    sources = [{"page": c["page"], "text": c["text"][:150] + "..." if len(c["text"]) > 150 else c["text"]} for c in relevant_chunks]
+    
+    # Save message history to SQLite
     cursor.execute('''
-        UPDATE documents 
-        SET submitted = 1, score = ?, user_answers = ? 
-        WHERE id = ?
-    ''', (score, json.dumps(user_answers), doc_id))
+        INSERT INTO chat_history (doc_id, role, content, sources_json, timestamp)
+        VALUES (?, 'user', ?, '[]', ?)
+    ''', (doc_id, user_message, timestamp))
     
-    # Insert new record into quiz_attempts table linked by doc_id
     cursor.execute('''
-        INSERT INTO quiz_attempts (doc_id, score, total, percentage, timestamp, filename)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (doc_id, score, total_q, percentage, timestamp, active_filename))
+        INSERT INTO chat_history (doc_id, role, content, sources_json, timestamp)
+        VALUES (?, 'assistant', ?, ?, ?)
+    ''', (doc_id, answer, json.dumps(sources), timestamp))
     
     conn.commit()
     conn.close()
     
-    flash(f"Quiz Submitted! You scored {score}/{total_q} ({percentage}%) on '{active_filename}'. Saved to database!", 'success')
-    return redirect(url_for('index'))
+    return jsonify({
+        "answer": answer,
+        "sources": sources,
+        "timestamp": timestamp
+    })
 
-@app.route('/reset_quiz', methods=['POST'])
-def reset_quiz():
-    """Resets the active document's quiz state in SQLite database."""
-    active_filename = session.get('active_filename')
+@app.route('/select_doc/<path:filename>')
+def select_doc(filename):
+    """Switches active PDF document."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT filename FROM documents WHERE filename = ?', (filename,))
+    row = cursor.fetchone()
+    conn.close()
     
-    if active_filename:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE documents 
-            SET submitted = 0, score = 0, user_answers = '{}' 
-            WHERE filename = ?
-        ''', (active_filename,))
-        conn.commit()
-        conn.close()
-        flash(f"Quiz reset for '{active_filename}'!", 'info')
+    if row:
+        session['active_filename'] = filename
+        flash(f"Switched active document to '{filename}'.", 'info')
+    else:
+        flash(f"Document '{filename}' not found.", 'error')
         
     return redirect(url_for('index'))
 
-@app.route('/clear_history', methods=['POST'])
-def clear_history():
-    """Clears score history for the active study document in SQLite database."""
-    active_filename = session.get('active_filename')
+@app.route('/delete_doc/<path:filename>', methods=['POST'])
+def delete_doc(filename):
+    """Deletes a document and its chat history."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM documents WHERE filename = ?', (filename,))
+    row = cursor.fetchone()
     
+    if row:
+        doc_id = row['id']
+        cursor.execute('DELETE FROM chat_history WHERE doc_id = ?', (doc_id,))
+        cursor.execute('DELETE FROM documents WHERE id = ?', (doc_id,))
+        conn.commit()
+        
+        if session.get('active_filename') == filename:
+            cursor.execute('SELECT filename FROM documents ORDER BY id DESC LIMIT 1')
+            rem = cursor.fetchone()
+            session['active_filename'] = rem['filename'] if rem else None
+            
+        flash(f"Deleted document '{filename}'.", 'info')
+        
+    conn.close()
+    return redirect(url_for('index'))
+
+@app.route('/api/clear', methods=['POST'])
+def clear_chat():
+    """Clears conversation history for the active PDF document."""
+    active_filename = session.get('active_filename')
     if active_filename:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT id FROM documents WHERE filename = ?', (active_filename,))
         row = cursor.fetchone()
         if row:
-            cursor.execute('DELETE FROM quiz_attempts WHERE doc_id = ?', (row['id'],))
+            cursor.execute('DELETE FROM chat_history WHERE doc_id = ?', (row['id'],))
             conn.commit()
         conn.close()
-        flash(f"Score history cleared for '{active_filename}'!", 'info')
+        return jsonify({"status": "success", "message": "Chat history cleared."})
         
-    return redirect(url_for('index'))
+    return jsonify({"status": "error", "message": "No active document."}), 400
 
 if __name__ == '__main__':
-    # Get port from environment variable (default: 5000 for local development)
     port = int(os.environ.get("PORT", 5000))
-    is_debug = os.environ.get("FLASK_ENV") == "development"
-    print(f"Starting web server on port {port}... Database path: {DB_PATH}")
-    app.run(host="0.0.0.0", port=port, debug=is_debug)
+    app.run(host="0.0.0.0", port=port)

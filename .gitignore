@@ -1,14 +1,29 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Local uploads and database
-uploads/*.pdf
-!uploads/.gitkeep
-database.db
-
-# Environments
+# Environment variables & secrets
 .env
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local databases & uploads
+*.db
+uploads/
+
+# Virtual environments
 venv/
+.venv/
+env/
 ENV/
+
+# IDE / System files
+.vscode/
+.idea/
+.DS_Store
+
+.env
+__pycache__/
+*.pyc
+venv/
