@@ -1,19 +1,51 @@
 import os
 import re
 import json
+import secrets
 import sqlite3
 import tempfile
 import requests
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask import (
+    Flask, render_template, request, redirect, url_for, flash, session, jsonify,
+    send_from_directory, abort, make_response
+)
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import (
+    LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+)
+from flask_wtf.csrf import CSRFProtect
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from pypdf import PdfReader
 
 # Load local environment variables from .env file
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# ==========================================
+# MODIFIED: Structured Security & Audit Logger
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("pdf_assistant_security")
+
+def get_clean_env(key):
+    """Retrieves an environment variable, stripping surrounding quotes or whitespace."""
+    val = os.getenv(key)
+    if not val:
+        return None
+    val = val.strip().strip('"').strip("'")
+    if not val or val in ("your_key_here", "your_gemini_api_key_here"):
+        return None
+    return val
+
+GROQ_API_KEY = get_clean_env("GROQ_API_KEY")
+GEMINI_API_KEY = get_clean_env("GEMINI_API_KEY")
 
 # Groq SDK Import
 try:
@@ -33,55 +65,159 @@ app = Flask(__name__)
 # Secret key required for Flask session management
 app.secret_key = os.environ.get("SECRET_KEY", "pdf-chatbot-study-assistant-secret-key")
 
+# ==========================================
+# MODIFIED: Session Security & Hardening Configuration
+# ==========================================
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=2)
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = (os.environ.get("FLASK_ENV") == "production")
+
+# Set maximum file upload size limit to 10MB
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB limit
+
 # Upload folder configuration (defaults to /tmp on Render for cloud compatibility)
 FALLBACK_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), 'pdf_chatbot_uploads')
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", FALLBACK_UPLOAD_DIR)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Set maximum file upload size limit to 5MB
-app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB limit
-
-# Ensure upload directory exists
+# Ensure master upload directory exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # SQLite Database Path configuration (defaults to /tmp on Render)
 FALLBACK_DB_PATH = os.path.join(tempfile.gettempdir(), 'pdf_chatbot.db')
 DB_PATH = os.environ.get("DATABASE_PATH", FALLBACK_DB_PATH)
 
+# ==========================================
+# MODIFIED: Flask-Login, CSRF & Rate Limiter Initialization
+# ==========================================
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please sign in to access your private PDF documents.'
+login_manager.login_message_category = 'info'
+
+csrf = CSRFProtect(app)
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://"
+)
+
+# ==========================================
+# MODIFIED: Secure HTTP Headers Middleware
+# ==========================================
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Content-Security-Policy'] = "default-src 'self' https: 'unsafe-inline' 'unsafe-eval'; img-src 'self' data: https:;"
+    return response
+
+# ==========================================
+# MODIFIED: Unauthenticated API Response Handler (HTTP 401)
+# ==========================================
+@login_manager.unauthorized_handler
+def unauthorized_handler():
+    session.clear()
+    if request.path.startswith('/api/'):
+        logger.warning(f"Unauthorized API access attempt to {request.path} from IP {request.remote_addr}")
+        return jsonify({"error": "Unauthorized", "message": "Authentication required to access this resource"}), 401
+    flash("Please sign in to access this page.", "info")
+    return redirect(url_for('login'))
+
+
 @app.errorhandler(413)
 def request_entity_too_large(error):
-    """Handles file uploads exceeding 5MB max content length."""
-    flash("File too large. Please upload a PDF under 5MB.", "error")
+    """Handles file uploads exceeding 10MB max content length."""
+    flash("File too large. Please upload a PDF file under 10MB.", "error")
     return redirect(url_for("index"))
 
+# ==========================================
+# MODIFIED: Database Connection & Foreign Key Enforcement
+# ==========================================
 def get_db_connection():
-    """Establishes and returns a connection to the SQLite database."""
+    """Establishes SQLite connection with PRAGMA foreign_keys = ON."""
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
 
+# ==========================================
+# MODIFIED: Multi-User Schema & Automatic Migration
+# ==========================================
 def init_db():
-    """Creates SQLite database tables for documents and chat history if they do not exist."""
+    """Creates SQLite tables for users, documents (with user_id FK), and chat_history."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Documents table
+    # 1. Users Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            reset_token TEXT,
+            reset_token_expiry TEXT,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    
+    # 2. Documents Table linked to users with CASCADE DELETE & UNIQUE(user_id, filename)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
             file_path TEXT NOT NULL,
             upload_time TEXT NOT NULL,
             extracted_text TEXT,
             word_count INTEGER,
-            chunks_json TEXT
+            chunks_json TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
         )
     ''')
-    
-    # 2. Chat history table linked to documents
+    # Check if existing documents table has foreign key constraint
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='documents'")
+    row = cursor.fetchone()
+    if row and row['sql'] and 'FOREIGN KEY' not in row['sql']:
+        logger.info("Migrating database schema for foreign key ON DELETE CASCADE support...")
+        # Ensure at least one user exists for foreign key validity
+        cursor.execute("SELECT COUNT(*) as count FROM users")
+        if cursor.fetchone()['count'] == 0:
+            default_pass = generate_password_hash("AdminPass123!")
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute("INSERT INTO users (id, username, email, password_hash, created_at) VALUES (1, 'default_admin', 'admin@example.com', ?, ?)", (default_pass, now_str))
+
+        cursor.execute("ALTER TABLE documents RENAME TO legacy_documents;")
+        cursor.execute('''
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                upload_time TEXT NOT NULL,
+                extracted_text TEXT,
+                word_count INTEGER,
+                chunks_json TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO documents (id, user_id, filename, file_path, upload_time, extracted_text, word_count, chunks_json)
+            SELECT id, 1, filename, file_path, upload_time, extracted_text, word_count, chunks_json FROM legacy_documents;
+        ''')
+        cursor.execute("DROP TABLE legacy_documents;")
+
+    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_user_filename ON documents(user_id, filename);')
+
+    # 3. Chat History Table linked to documents with CASCADE DELETE
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,22 +229,142 @@ def init_db():
             FOREIGN KEY (doc_id) REFERENCES documents (id) ON DELETE CASCADE
         )
     ''')
-    
+
     conn.commit()
     conn.close()
+
+
+
 
 # Initialize DB schema on server startup
 init_db()
 
-def is_pdf(filename):
-    """Checks if the filename has a .pdf extension."""
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() == 'pdf'
+# ==========================================
+# MODIFIED: User Data Model & Flask-Login User Loader
+# ==========================================
+class User(UserMixin):
+    def __init__(self, id, username, email, password_hash, reset_token=None, reset_token_expiry=None, created_at=None):
+        self.id = id
+        self.username = username
+        self.email = email
+        self.password_hash = password_hash
+        self.reset_token = reset_token
+        self.reset_token_expiry = reset_token_expiry
+        self.created_at = created_at
 
+    @staticmethod
+    def get_by_id(user_id):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return User(**dict(row))
+        return None
+
+    @staticmethod
+    def get_by_identifier(identifier):
+        """Fetch user by username or email (case-insensitive)."""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)', (identifier, identifier))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return User(**dict(row))
+        return None
+
+    @staticmethod
+    def get_by_email(email):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE LOWER(email) = LOWER(?)', (email,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return User(**dict(row))
+        return None
+
+    @staticmethod
+    def get_by_reset_token(token):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE reset_token = ?', (token,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return User(**dict(row))
+        return None
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.get_by_id(user_id)
+
+# ==========================================
+# MODIFIED: Path Traversal Defense & File Isolation Helpers
+# ==========================================
+ALLOWED_EXTENSIONS = {'pdf'}
+
+def is_pdf(filename):
+    """Checks if the filename has a valid .pdf extension."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_user_upload_dir(user_id):
+    """Returns absolute path to user-isolated directory uploads/<user_id>/."""
+    user_dir = os.path.join(app.config['UPLOAD_FOLDER'], str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+def validate_user_file_path(user_id, filename):
+    """
+    Path Traversal Security Guard:
+    Resolves absolute path and verifies it strictly resides inside uploads/<user_id>/ folder.
+    Returns absolute path if valid, or None if path traversal attempt is detected.
+    """
+    if not filename or '..' in filename or '/' in filename or '\\' in filename:
+        logger.error(f"SECURITY VIOLATION: Path traversal attempt blocked for user_id={user_id}, filename='{filename}'")
+        return None
+
+    user_dir = os.path.abspath(get_user_upload_dir(user_id))
+    raw_clean = secure_filename(filename)
+    if not raw_clean:
+        return None
+
+    target_path = os.path.abspath(os.path.join(user_dir, raw_clean))
+    if not target_path.startswith(user_dir):
+        logger.error(f"SECURITY VIOLATION: Path traversal attack blocked for user_id={user_id}, filename='{filename}'")
+        return None
+    return target_path
+
+
+def get_user_document_or_403(filename):
+    """
+    Strict Ownership Check:
+    Fetches document owned by current_user.id. Aborts with HTTP 403 Forbidden if unauthorized.
+    """
+    if not current_user.is_authenticated:
+        abort(401)
+        
+    user_id = int(current_user.id)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM documents WHERE filename = ? AND user_id = ?', (filename, user_id))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        logger.warning(f"UNAUTHORIZED ACCESS ATTEMPT: User {user_id} tried accessing document '{filename}'")
+        abort(403)
+        
+    return dict(row)
+
+
+# ==========================================
+# PDF Text Extraction & RAG Engine
+# ==========================================
 def extract_pdf_pages_and_chunks(file_path, chunk_size=700, chunk_overlap=120):
-    """
-    Extracts text from PDF page by page using pypdf and builds overlapping text chunks
-    with page number metadata for RAG retrieval.
-    """
+    """Extracts text page by page using pypdf and builds overlapping text chunks."""
     try:
         reader = PdfReader(file_path)
         full_text_list = []
@@ -123,7 +379,6 @@ def extract_pdf_pages_and_chunks(file_path, chunk_size=700, chunk_overlap=120):
             cleaned_page_text = re.sub(r'\s+', ' ', page_text).strip()
             full_text_list.append(f"--- Page {page_idx} ---\n{cleaned_page_text}")
             
-            # Divide page text into overlapping windows
             start = 0
             text_len = len(cleaned_page_text)
             
@@ -131,7 +386,6 @@ def extract_pdf_pages_and_chunks(file_path, chunk_size=700, chunk_overlap=120):
                 end = start + chunk_size
                 chunk_str = cleaned_page_text[start:end]
                 
-                # Trim to word boundary
                 if end < text_len and ' ' in chunk_str[-20:]:
                     last_space = chunk_str.rfind(' ')
                     chunk_str = chunk_str[:last_space]
@@ -158,14 +412,11 @@ def extract_pdf_pages_and_chunks(file_path, chunk_size=700, chunk_overlap=120):
         return full_text, chunks, word_count
     
     except Exception as e:
-        print(f"Error extracting PDF text: {e}")
+        logger.error(f"Error extracting PDF text: {e}")
         return f"Error reading PDF file: {str(e)}", [], 0
 
 def retrieve_relevant_chunks(query, chunks, top_k=3):
-    """
-    RAG Retrieval Engine: Computes relevance scores for each chunk
-    and returns top_k (max 3 chunks only) most relevant text chunks.
-    """
+    """RAG Retrieval Engine: returns top_k most relevant text chunks."""
     if not chunks or not query.strip():
         return []
     
@@ -189,11 +440,9 @@ def retrieve_relevant_chunks(query, chunks, top_k=3):
         chunk_text_lower = chunk['text'].lower()
         score = 0.0
         
-        # Exact phrase match bonus
         if len(query.strip()) > 5 and query.strip().lower() in chunk_text_lower:
             score += 15.0
             
-        # Token frequency scoring
         for token in query_tokens:
             count = len(re.findall(r'\b' + re.escape(token) + r'\b', chunk_text_lower))
             if count > 0:
@@ -207,85 +456,63 @@ def retrieve_relevant_chunks(query, chunks, top_k=3):
     scored_chunks.sort(key=lambda x: x[0], reverse=True)
     selected_chunks = [item[1] for item in scored_chunks[:top_k]]
     
-    # Fallback if no exact keyword match: return first top_k chunks
     if not selected_chunks and chunks:
         selected_chunks = chunks[:top_k]
         
     return selected_chunks[:3]
 
 def generate_groq_answer(question, context_chunks):
-    """
-    Generates a natural language answer using Groq API (llama3-8b-8192) based strictly on retrieved PDF context.
-    Returns None if GROQ_API_KEY is missing or API call fails.
-    """
-    groq_key = os.getenv("GROQ_API_KEY")
-    if not groq_key or groq_key == "your_key_here" or not Groq:
+    """Generates an answer using Groq API based on PDF context."""
+    groq_key = get_clean_env("GROQ_API_KEY")
+    if not groq_key or not Groq:
         return None
         
     if not context_chunks:
         return "No relevant content found in document"
         
     try:
-        # Combine top 3 retrieved chunks into a single context string
         context_str = "\n\n".join([f"[Page {c['page']}]: {c['text']}" for c in context_chunks[:3]])
-        
-        # Limit context length to 4000 characters max
         if len(context_str) > 4000:
             context_str = context_str[:4000] + "..."
             
         client = Groq(api_key=groq_key)
-        
         system_prompt = (
             "You are a helpful assistant. Answer ONLY using the provided context. "
             "If the answer is not in the context, say 'Not found in document'. "
             "Do not make up information."
         )
-        
         user_content = f"Context:\n{context_str}\n\nQuestion: {question}"
         
-        # Groq model list: try llama-3.1-8b-instant or fallback to llama-3.3-70b-versatile
-        model_name = "llama-3.1-8b-instant"
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                temperature=0.3,
-                max_tokens=600
-            )
-        except Exception:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content}
-                ],
-                temperature=0.3,
-                max_tokens=600
-            )
-        
-        if response and response.choices and len(response.choices) > 0:
-            return response.choices[0].message.content.strip()
+        candidate_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama3-8b-8192"]
+        for m_name in candidate_models:
+            try:
+                response = client.chat.completions.create(
+                    model=m_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    temperature=0.3,
+                    max_tokens=600
+                )
+                if response and response.choices and len(response.choices) > 0:
+                    return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.error(f"Groq API Error with model {m_name}: {e}")
             
     except Exception as err:
-        print(f"Groq API Error: {err}")
+        logger.error(f"Groq API Exception: {err}")
         
     return None
 
 def generate_gemini_answer(question, context_chunks):
-    """
-    Generates a natural language answer using Google Gemini API based strictly on the retrieved PDF context.
-    If context does not contain the answer, returns 'Not found in document'.
-    """
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_key or gemini_key == "your_gemini_api_key_here" or not genai:
+    """Generates answer using Google Gemini API based on PDF context."""
+    gemini_key = get_clean_env("GEMINI_API_KEY")
+    if not gemini_key or not genai:
         return None
         
     try:
         genai.configure(api_key=gemini_key)
-        
         context_str = "\n\n".join([f"[Page {c['page']}]: {c['text']}" for c in context_chunks])
         
         prompt = (
@@ -306,20 +533,17 @@ def generate_gemini_answer(question, context_chunks):
             return response.text.strip()
             
     except Exception as err:
-        print(f"Gemini API Error: {err}")
+        logger.error(f"Gemini API Error: {err}")
         
     return None
 
 def generate_fallback_extractive_answer(question, relevant_chunks):
-    """
-    Generates a structured extractive answer from retrieved PDF chunks when LLM API is unavailable or fails.
-    """
+    """Generates structured extractive answer from PDF chunks when LLM APIs are unavailable."""
     if not relevant_chunks:
         return "Not found in document"
     
     question_lower = question.lower()
     is_summary_req = any(w in question_lower for w in ['summary', 'summarize', 'overview', 'main point', 'about'])
-    
     output_lines = []
     
     if is_summary_req:
@@ -337,45 +561,220 @@ def generate_fallback_extractive_answer(question, relevant_chunks):
             output_lines.append(f"**Section {idx} (Page {chunk['page']})**:")
             output_lines.append(f"> \"{key_excerpt}\"\n")
             
-        output_lines.append("*💡 Note: Set `GROQ_API_KEY` in your .env file to enable Groq LLaMA 3 AI responses.*")
+        if get_clean_env("GROQ_API_KEY") or get_clean_env("GEMINI_API_KEY"):
+            output_lines.append("*💡 Note: API key is configured on server, but API call failed. Displaying extractive fallback.*")
+        else:
+            output_lines.append("*💡 Note: Set `GROQ_API_KEY` in Render Environment Variables to enable Groq LLaMA 3 AI responses.*")
         
     return "\n".join(output_lines)
 
 def generate_llm_answer(question, relevant_chunks, chat_history=[]):
-    """
-    Hybrid System:
-    1. If GROQ_API_KEY is available -> call Groq API (llama3-8b-8192) with top 3 chunks.
-    2. Else -> try Gemini API if available.
-    3. Else (or if API calls fail) -> fallback to existing extractive QA system.
-    """
+    """Hybrid System: Groq -> Gemini -> Fallback Extractive QA."""
     top_chunks = relevant_chunks[:3]
     
-    # 1. Try Groq API
     groq_answer = generate_groq_answer(question, top_chunks)
     if groq_answer:
         return groq_answer
         
-    # 2. Try Gemini API
     gemini_answer = generate_gemini_answer(question, top_chunks)
     if gemini_answer:
         return gemini_answer
         
-    # 3. Fallback to Extractive QA
     return generate_fallback_extractive_answer(question, top_chunks)
 
-# Flask Web Routes
+# ==========================================
+# MODIFIED: Authentication Routes
+# ==========================================
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    """User Registration Route with Password Strength Validation."""
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+
+        # Password Strength Validation (Minimum 8 characters)
+        if len(password) < 8:
+            flash("Password must be at least 8 characters long.", "error")
+            return render_template('register.html')
+
+        if password != confirm_password:
+            flash("Passwords do not match.", "error")
+            return render_template('register.html')
+
+        if User.get_by_identifier(username):
+            flash("Username is already taken. Please choose another.", "error")
+            return render_template('register.html')
+
+        if User.get_by_email(email):
+            flash("An account with this email already exists.", "error")
+            return render_template('register.html')
+
+        password_hash = generate_password_hash(password)
+        created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO users (username, email, password_hash, created_at)
+            VALUES (?, ?, ?, ?)
+        ''', (username, email, password_hash, created_at))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"New user registered successfully: username='{username}', email='{email}'")
+        flash("Account created successfully! Please sign in.", "success")
+        return redirect(url_for('login'))
+
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """User Login Route."""
+    # ==========================================
+    # HIGHLIGHTED FIX: Check both Flask-Login and session['user_id']
+    # ==========================================
+    if current_user.is_authenticated and 'user_id' in session:
+        return redirect(url_for('index'))
+
+    if request.method == 'POST':
+        identifier = request.form.get('username_or_email', '').strip()
+        password = request.form.get('password', '')
+
+        user = User.get_by_identifier(identifier)
+        if user and check_password_hash(user.password_hash, password):
+            session.clear()
+            # HIGHLIGHTED FIX: Store user_id in session
+            session['user_id'] = user.id
+            login_user(user, remember=False)  # Avoid persistent remember_token auto-relogin
+            session.permanent = True
+            logger.info(f"User signed in successfully: id={user.id}, username='{user.username}'")
+            flash(f"Welcome back, {user.username}!", "success")
+            next_page = request.args.get('next')
+            return redirect(next_page or url_for('index'))
+
+        logger.warning(f"Failed login attempt for identifier='{identifier}' from IP {request.remote_addr}")
+        flash("Invalid username/email or password.", "error")
+
+    return render_template('login.html')
+
+@app.route('/logout', methods=['POST', 'GET'])
+def logout():
+    """
+    ==========================================
+    HIGHLIGHTED FIX: User Logout Route
+    Completely destroys Flask session & deletes session/remember cookies on response
+    ==========================================
+    """
+    user_id = session.get('user_id') or (current_user.id if current_user.is_authenticated else 'unknown')
+    logger.info(f"Logging out user: id={user_id}")
+
+    logout_user()
+    session.clear()
+    
+    logger.info(f"DEBUG - Session after clear: {dict(session)}")
+    
+    flash("You have been signed out successfully.", "info")
+    
+    response = make_response(redirect(url_for('login')))
+    cookie_name = app.config.get('SESSION_COOKIE_NAME', 'session')
+    response.delete_cookie(cookie_name)
+    response.delete_cookie('remember_token')
+    response.set_cookie(cookie_name, '', expires=0)
+    response.set_cookie('remember_token', '', expires=0)
+    return response
+
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    """Password Reset Token Generation."""
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        user = User.get_by_email(email)
+        
+        if user:
+            token = secrets.token_urlsafe(32)
+            expiry = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?', (token, expiry, user.id))
+            conn.commit()
+            conn.close()
+            
+            reset_url = url_for('reset_password', token=token, _external=True)
+            logger.info(f"Password reset link generated for email='{email}': {reset_url}")
+            flash(f"Password reset link generated! Use this URL: {reset_url}", "success")
+        else:
+            flash("If an account exists for that email, a password reset link has been generated.", "info")
+            
+    return render_template('forgot_password.html')
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    """Password Reset Token Verification & Password Update."""
+    user = User.get_by_reset_token(token)
+    if not user:
+        flash("Invalid or expired password reset token.", "error")
+        return redirect(url_for('login'))
+        
+    if user.reset_token_expiry:
+        expiry_dt = datetime.strptime(user.reset_token_expiry, '%Y-%m-%d %H:%M:%S')
+        if datetime.now() > expiry_dt:
+            flash("Reset token has expired. Please request a new one.", "error")
+            return redirect(url_for('forgot_password'))
+
+    if request.method == 'POST':
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        
+        if len(password) < 8:
+            flash("Password must be at least 8 characters long.", "error")
+            return render_template('reset_password.html', token=token, username=user.username)
+            
+        if password != confirm_password:
+            flash("Passwords do not match.", "error")
+            return render_template('reset_password.html', token=token, username=user.username)
+            
+        password_hash = generate_password_hash(password)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expiry = NULL WHERE id = ?', (password_hash, user.id))
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Password updated successfully via reset token for user_id={user.id}")
+        flash("Password updated successfully! Please sign in with your new password.", "success")
+        return redirect(url_for('login'))
+
+    return render_template('reset_password.html', token=token, username=user.username)
+
+# ==========================================
+# MODIFIED: Protected Multi-User Application Routes
+# ==========================================
 
 @app.route('/')
+@login_required
 def index():
-    """Main Chat UI route."""
+    """Main Chat UI route isolated for current_user.id."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute('SELECT id, filename, word_count, upload_time FROM documents ORDER BY id DESC')
+    # Query only documents belonging to logged-in user
+    cursor.execute('SELECT id, filename, word_count, upload_time FROM documents WHERE user_id = ? ORDER BY id DESC', (current_user.id,))
     doc_rows = cursor.fetchall()
     documents = [dict(row) for row in doc_rows]
     
     active_filename = session.get('active_filename')
+    # Reset active filename if it doesn't belong to current user
+    if active_filename and not any(d['filename'] == active_filename for d in documents):
+        active_filename = None
+        
     if not active_filename and documents:
         active_filename = documents[0]['filename']
         session['active_filename'] = active_filename
@@ -384,7 +783,7 @@ def index():
     chat_messages = []
     
     if active_filename:
-        cursor.execute('SELECT * FROM documents WHERE filename = ?', (active_filename,))
+        cursor.execute('SELECT * FROM documents WHERE filename = ? AND user_id = ?', (active_filename, current_user.id))
         doc_row = cursor.fetchone()
         if doc_row:
             active_doc = dict(doc_row)
@@ -397,10 +796,7 @@ def index():
                 
     conn.close()
     
-    has_api = bool(
-        (os.getenv("GROQ_API_KEY") and os.getenv("GROQ_API_KEY") != "your_key_here") or
-        (os.getenv("GEMINI_API_KEY") and os.getenv("GEMINI_API_KEY") != "your_gemini_api_key_here")
-    )
+    has_api = bool(get_clean_env("GROQ_API_KEY") or get_clean_env("GEMINI_API_KEY"))
     
     return render_template(
         'index.html',
@@ -412,8 +808,9 @@ def index():
     )
 
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload_pdf():
-    """Handles PDF file upload, text extraction, chunking, and SQLite storage."""
+    """Handles PDF file upload into user-isolated directory uploads/<user_id>/."""
     if 'file' not in request.files:
         flash('No file part in the request.', 'error')
         return redirect(url_for('index'))
@@ -424,8 +821,17 @@ def upload_pdf():
         return redirect(url_for('index'))
         
     if file and is_pdf(file.filename):
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        raw_filename = secure_filename(file.filename)
+        if not raw_filename:
+            flash('Invalid filename.', 'error')
+            return redirect(url_for('index'))
+
+        # Path Traversal Guard
+        file_path = validate_user_file_path(current_user.id, raw_filename)
+        if not file_path:
+            flash('Invalid file path or name.', 'error')
+            return redirect(url_for('index'))
+
         file.save(file_path)
         
         extracted_text, chunks, word_count = extract_pdf_pages_and_chunks(file_path)
@@ -434,30 +840,91 @@ def upload_pdf():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute('''
-            INSERT INTO documents (filename, file_path, upload_time, extracted_text, word_count, chunks_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(filename) DO UPDATE SET
-                file_path=excluded.file_path,
-                upload_time=excluded.upload_time,
-                extracted_text=excluded.extracted_text,
-                word_count=excluded.word_count,
-                chunks_json=excluded.chunks_json
-        ''', (filename, file_path, upload_time, extracted_text, word_count, json.dumps(chunks)))
+        cursor.execute('SELECT id FROM documents WHERE user_id = ? AND filename = ?', (current_user.id, raw_filename))
+        existing = cursor.fetchone()
+        
+        if existing:
+            cursor.execute('''
+                UPDATE documents
+                SET file_path = ?, upload_time = ?, extracted_text = ?, word_count = ?, chunks_json = ?
+                WHERE id = ?
+            ''', (file_path, upload_time, extracted_text, word_count, json.dumps(chunks), existing['id']))
+        else:
+            cursor.execute('''
+                INSERT INTO documents (user_id, filename, file_path, upload_time, extracted_text, word_count, chunks_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (current_user.id, raw_filename, file_path, upload_time, extracted_text, word_count, json.dumps(chunks)))
         
         conn.commit()
         conn.close()
+
         
-        session['active_filename'] = filename
-        flash(f"Uploaded '{filename}'! Processed {word_count} words into {len(chunks)} searchable chunks.", 'success')
+        session['active_filename'] = raw_filename
+        logger.info(f"User {current_user.id} uploaded PDF '{raw_filename}' ({word_count} words).")
+        flash(f"Uploaded '{raw_filename}'! Processed {word_count} words into {len(chunks)} searchable chunks.", 'success')
         return redirect(url_for('index'))
     else:
-        flash('Invalid file type! Please upload a valid .pdf file.', 'error')
+        flash('Invalid file type! Only .pdf files are allowed.', 'error')
         return redirect(url_for('index'))
 
+@app.route('/download/<path:filename>')
+@login_required
+def download_doc(filename):
+    """Secure File Access Endpoint with Path Traversal Defense & Ownership Check."""
+    doc = get_user_document_or_403(filename)
+    user_dir = os.path.abspath(get_user_upload_dir(current_user.id))
+    
+    file_path = validate_user_file_path(current_user.id, doc['filename'])
+    if not file_path or not os.path.exists(file_path):
+        flash("File not found on server.", "error")
+        return redirect(url_for('index'))
+        
+    return send_from_directory(user_dir, doc['filename'], as_attachment=True)
+
+@app.route('/select_doc/<path:filename>')
+@login_required
+def select_doc(filename):
+    """Switches active document after strict ownership validation."""
+    get_user_document_or_403(filename)
+    session['active_filename'] = filename
+    flash(f"Switched active document to '{filename}'.", 'info')
+    return redirect(url_for('index'))
+
+@app.route('/delete_doc/<path:filename>', methods=['POST'])
+@login_required
+def delete_doc(filename):
+    """Deletes a user's document and associated chat history."""
+    doc = get_user_document_or_403(filename)
+    doc_id = doc['id']
+    
+    file_path = validate_user_file_path(current_user.id, filename)
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Error removing physical file '{file_path}': {e}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM chat_history WHERE doc_id = ?', (doc_id,))
+    cursor.execute('DELETE FROM documents WHERE id = ? AND user_id = ?', (doc_id, current_user.id))
+    conn.commit()
+    
+    if session.get('active_filename') == filename:
+        cursor.execute('SELECT filename FROM documents WHERE user_id = ? ORDER BY id DESC LIMIT 1', (current_user.id,))
+        rem = cursor.fetchone()
+        session['active_filename'] = rem['filename'] if rem else None
+        
+    conn.close()
+    logger.info(f"User {current_user.id} deleted document '{filename}'.")
+    flash(f"Deleted document '{filename}'.", 'info')
+    return redirect(url_for('index'))
+
 @app.route('/api/chat', methods=['POST'])
+@login_required
+@limiter.limit("10 per minute")
 def chat_api():
-    """AJAX Chat endpoint: accepts question, retrieves top 3 chunks, calls hybrid LLM/extractive system."""
+    """AJAX Chat Endpoint with Rate Limiting (10 req/min) & Data Isolation."""
     data = request.get_json() or {}
     user_message = data.get('message', '').strip()
     
@@ -470,12 +937,12 @@ def chat_api():
         
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM documents WHERE filename = ?', (active_filename,))
+    cursor.execute('SELECT * FROM documents WHERE filename = ? AND user_id = ?', (active_filename, current_user.id))
     doc_row = cursor.fetchone()
     
     if not doc_row:
         conn.close()
-        return jsonify({"answer": "Active document not found in database.", "sources": []}), 404
+        return jsonify({"answer": "Active document not found in your account.", "sources": []}), 404
         
     doc_id = doc_row['id']
     chunks = json.loads(doc_row['chunks_json']) if doc_row['chunks_json'] else []
@@ -483,19 +950,18 @@ def chat_api():
     # 1. Retrieve top 3 relevant chunks
     relevant_chunks = retrieve_relevant_chunks(user_message, chunks, top_k=3)[:3]
     
-    # 2. Fetch recent conversation history
+    # 2. Fetch conversation history for this document
     cursor.execute('SELECT role, content FROM chat_history WHERE doc_id = ? ORDER BY id DESC LIMIT 6', (doc_id,))
     history_rows = cursor.fetchall()
     history = [dict(r) for r in reversed(history_rows)]
     
-    # 3. Generate answer via Hybrid system (Groq -> Gemini -> Fallback QA)
+    # 3. Generate answer via Hybrid system
     answer = generate_llm_answer(user_message, relevant_chunks, chat_history=history)
     timestamp = datetime.now().strftime('%I:%M %p')
     
-    # Prepare top 3 source citations
     sources = [{"page": c["page"], "text": c["text"][:150] + "..." if len(c["text"]) > 150 else c["text"]} for c in relevant_chunks]
     
-    # Save message history to SQLite
+    # Save conversation history to SQLite
     cursor.execute('''
         INSERT INTO chat_history (doc_id, role, content, sources_json, timestamp)
         VALUES (?, 'user', ?, '[]', ?)
@@ -515,55 +981,15 @@ def chat_api():
         "timestamp": timestamp
     })
 
-@app.route('/select_doc/<path:filename>')
-def select_doc(filename):
-    """Switches active PDF document."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT filename FROM documents WHERE filename = ?', (filename,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if row:
-        session['active_filename'] = filename
-        flash(f"Switched active document to '{filename}'.", 'info')
-    else:
-        flash(f"Document '{filename}' not found.", 'error')
-        
-    return redirect(url_for('index'))
-
-@app.route('/delete_doc/<path:filename>', methods=['POST'])
-def delete_doc(filename):
-    """Deletes a document and its chat history."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT id FROM documents WHERE filename = ?', (filename,))
-    row = cursor.fetchone()
-    
-    if row:
-        doc_id = row['id']
-        cursor.execute('DELETE FROM chat_history WHERE doc_id = ?', (doc_id,))
-        cursor.execute('DELETE FROM documents WHERE id = ?', (doc_id,))
-        conn.commit()
-        
-        if session.get('active_filename') == filename:
-            cursor.execute('SELECT filename FROM documents ORDER BY id DESC LIMIT 1')
-            rem = cursor.fetchone()
-            session['active_filename'] = rem['filename'] if rem else None
-            
-        flash(f"Deleted document '{filename}'.", 'info')
-        
-    conn.close()
-    return redirect(url_for('index'))
-
 @app.route('/api/clear', methods=['POST'])
+@login_required
 def clear_chat():
-    """Clears conversation history for the active PDF document."""
+    """Clears conversation history for current_user's active document."""
     active_filename = session.get('active_filename')
     if active_filename:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT id FROM documents WHERE filename = ?', (active_filename,))
+        cursor.execute('SELECT id FROM documents WHERE filename = ? AND user_id = ?', (active_filename, current_user.id))
         row = cursor.fetchone()
         if row:
             cursor.execute('DELETE FROM chat_history WHERE doc_id = ?', (row['id'],))

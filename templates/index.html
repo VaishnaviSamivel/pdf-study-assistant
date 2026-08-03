@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PDF Chatbot - ChatGPT for PDFs</title>
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -38,10 +39,11 @@
             <!-- Upload Box -->
             <div class="upload-section">
                 <form action="{{ url_for('upload_pdf') }}" method="POST" enctype="multipart/form-data" id="uploadForm">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                     <label for="pdfFileInput" class="upload-dropzone">
                         <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
                         <span class="upload-title">Upload new PDF</span>
-                        <span class="upload-subtitle">Drag & drop or browse (Max 5MB)</span>
+                        <span class="upload-subtitle">Drag & drop or browse (Max 10MB)</span>
                         <input type="file" id="pdfFileInput" name="file" accept=".pdf" onchange="document.getElementById('uploadForm').submit()">
                     </label>
                 </form>
@@ -67,11 +69,17 @@
                                         <span class="doc-meta">{{ doc.word_count }} words</span>
                                     </div>
                                 </a>
-                                <form action="{{ url_for('delete_doc', filename=doc.filename) }}" method="POST" class="delete-form" onsubmit="return confirm('Delete this PDF and its chat history?')">
-                                    <button type="submit" class="doc-delete-btn" title="Delete PDF">
-                                        <i class="fa-solid fa-trash-can"></i>
-                                    </button>
-                                </form>
+                                <div class="doc-actions">
+                                    <a href="{{ url_for('download_doc', filename=doc.filename) }}" class="doc-download-btn" title="Download PDF" target="_blank">
+                                        <i class="fa-solid fa-download"></i>
+                                    </a>
+                                    <form action="{{ url_for('delete_doc', filename=doc.filename) }}" method="POST" class="delete-form" onsubmit="return confirm('Delete this PDF and its chat history?')">
+                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                                        <button type="submit" class="doc-delete-btn" title="Delete PDF">
+                                            <i class="fa-solid fa-trash-can"></i>
+                                        </button>
+                                    </form>
+                                </div>
                             </div>
                         {% endfor %}
                     {% else %}
@@ -83,8 +91,24 @@
                 </div>
             </div>
 
-            <!-- Sidebar Footer -->
+            <!-- User Profile & Sidebar Footer -->
             <div class="sidebar-footer">
+                <div class="user-profile-bar">
+                    <div class="user-avatar">
+                        <i class="fa-solid fa-circle-user"></i>
+                    </div>
+                    <div class="user-details">
+                        <span class="user-name" title="{{ current_user.username }}">{{ current_user.username }}</span>
+                        <span class="user-email" title="{{ current_user.email }}">{{ current_user.email }}</span>
+                    </div>
+                    <form action="{{ url_for('logout') }}" method="POST" class="logout-form">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                        <button type="submit" class="logout-btn" title="Sign Out">
+                            <i class="fa-solid fa-right-from-bracket"></i>
+                        </button>
+                    </form>
+                </div>
+
                 {% if active_doc %}
                 <button class="clear-chat-btn" id="clearChatBtn">
                     <i class="fa-solid fa-broom"></i>
@@ -109,6 +133,15 @@
                     {% else %}
                         <span>PDF Assistant</span>
                     {% endif %}
+                </div>
+                <div class="top-user-info">
+                    <span class="user-tag"><i class="fa-solid fa-user"></i> {{ current_user.username }}</span>
+                    <form action="{{ url_for('logout') }}" method="POST" style="display:inline;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                        <button type="submit" class="top-logout-btn" title="Sign Out">
+                            <i class="fa-solid fa-right-from-bracket"></i>
+                        </button>
+                    </form>
                 </div>
             </header>
 
@@ -136,9 +169,14 @@
                             <i class="fa-solid fa-file-arrow-up"></i>
                         </div>
                         <h1>Upload a PDF to Start Chatting</h1>
-                        <p>Upload any study material, textbook chapter, or report (under 5MB) to ask context-aware questions and receive instant answers.</p>
+                        <p>Upload any study material, textbook chapter, or report (under 10MB) to ask context-aware questions and receive instant answers.</p>
                         
                         <div class="feature-grid">
+                            <div class="feature-card">
+                                <i class="fa-solid fa-shield-halved"></i>
+                                <h3>Private & Isolated</h3>
+                                <p>Your documents are strictly visible only to your account.</p>
+                            </div>
                             <div class="feature-card">
                                 <i class="fa-solid fa-magnifying-glass"></i>
                                 <h3>Context-Aware RAG</h3>
@@ -148,11 +186,6 @@
                                 <i class="fa-solid fa-quote-left"></i>
                                 <h3>Source Context</h3>
                                 <p>Inspect exact page references and quotes used to generate every response.</p>
-                            </div>
-                            <div class="feature-card">
-                                <i class="fa-solid fa-comments"></i>
-                                <h3>Persistent History</h3>
-                                <p>Stores conversation history for every PDF document in SQLite.</p>
                             </div>
                         </div>
                     </div>
@@ -249,6 +282,11 @@
 
     <!-- Frontend Script -->
     <script>
+        function getCsrfToken() {
+            const meta = document.querySelector('meta[name="csrf-token"]');
+            return meta ? meta.getAttribute('content') : '';
+        }
+
         // Sidebar Toggle for Mobile
         const openSidebarBtn = document.getElementById('openSidebarBtn');
         const closeSidebarBtn = document.getElementById('closeSidebarBtn');
@@ -362,9 +400,33 @@
             try {
                 const response = await fetch('/api/chat', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': getCsrfToken()
+                    },
                     body: JSON.stringify({ message: message })
                 });
+
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+
+                if (response.status === 429) {
+                    thinkingRow.remove();
+                    const rateRow = document.createElement('div');
+                    rateRow.className = 'message-row assistant error';
+                    rateRow.innerHTML = `
+                        <div class="avatar"><i class="fa-solid fa-triangle-exclamation"></i></div>
+                        <div class="message-bubble">
+                            <div class="message-content" style="color: var(--danger-color);">
+                                Rate limit exceeded. Please wait a minute before sending another question (Max 10 per min).
+                            </div>
+                        </div>
+                    `;
+                    chatStream.appendChild(rateRow);
+                    return;
+                }
 
                 const data = await response.json();
                 
@@ -433,7 +495,10 @@
             clearChatBtn.addEventListener('click', async () => {
                 if (!confirm('Are you sure you want to clear the active conversation history?')) return;
                 try {
-                    const res = await fetch('/api/clear', { method: 'POST' });
+                    const res = await fetch('/api/clear', { 
+                        method: 'POST',
+                        headers: { 'X-CSRFToken': getCsrfToken() }
+                    });
                     const data = await res.json();
                     if (data.status === 'success') {
                         window.location.reload();
